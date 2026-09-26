@@ -1,16 +1,13 @@
-from pathlib import Path
 import sys
-import yt_dlp
 
+from downloader import (
+    RetroRipDownloader,
+    DOWNLOAD_PROFILES,
+)
 
-# ============================================================
-# CONFIG
-# ============================================================
 
 APP_NAME = "RetroRip"
-VERSION = "0.2"
-
-DOWNLOAD_DIR = Path("downloads")
+VERSION = "0.3"
 
 
 # ============================================================
@@ -18,260 +15,203 @@ DOWNLOAD_DIR = Path("downloads")
 # ============================================================
 
 def format_duration(seconds):
-    if not seconds:
+
+    if seconds is None:
         return "Unknown"
 
     seconds = int(seconds)
 
     hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
+
+    minutes = (
+        seconds % 3600
+    ) // 60
+
     secs = seconds % 60
 
     if hours:
-        return f"{hours:02}:{minutes:02}:{secs:02}"
 
-    return f"{minutes:02}:{secs:02}"
+        return (
+            f"{hours:02}:"
+            f"{minutes:02}:"
+            f"{secs:02}"
+        )
+
+    return (
+        f"{minutes:02}:"
+        f"{secs:02}"
+    )
 
 
-def print_header():
-    print()
-    print("=" * 55)
-    print(f"              {APP_NAME} v{VERSION}")
-    print("       Rewind the web. Keep the media.")
-    print("=" * 55)
-    print()
+def format_bytes(value):
+
+    if value is None:
+        return "?"
+
+    units = [
+        "B",
+        "KB",
+        "MB",
+        "GB",
+    ]
+
+    size = float(value)
+
+    for unit in units:
+
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+
+        size /= 1024
+
+    return f"{size:.2f} TB"
 
 
 # ============================================================
-# MEDIA INFO
+# CALLBACKS
 # ============================================================
 
-def get_media_info(url):
-    options = {
-        "quiet": True,
-        "no_warnings": True,
+def status_callback(message):
 
-        # อย่าเพิ่งดาวน์โหลด
-        "skip_download": True,
+    print(
+        f"\n[STATUS] {message}"
+    )
 
-        # Playlist เอาแค่ตัวเดียวก่อน
-        "noplaylist": True,
-    }
 
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(
-                url,
-                download=False
+def progress_callback(data):
+
+    if (
+        data["status"]
+        == "downloading"
+    ):
+
+        percent = data.get(
+            "percent"
+        )
+
+        speed = data.get(
+            "speed"
+        )
+
+        eta = data.get(
+            "eta"
+        )
+
+        downloaded = data.get(
+            "downloaded_bytes"
+        )
+
+        total = data.get(
+            "total_bytes"
+        )
+
+        if percent is None:
+
+            percent_text = "??.?%"
+
+        else:
+
+            percent_text = (
+                f"{percent:5.1f}%"
             )
 
-        return info
+        message = (
+            f"\r[DOWNLOAD] "
+            f"{percent_text}"
+        )
 
-    except Exception as error:
-        print()
-        print("[ERROR] Cannot read media information.")
-        print(error)
+        if downloaded:
 
-        return None
+            message += (
+                " | "
+                + format_bytes(
+                    downloaded
+                )
+            )
 
+        if total:
 
-# ============================================================
-# FORMAT
-# ============================================================
-
-def select_format():
-    print()
-    print("Select output format")
-    print("-" * 35)
-    print("[1] MP4 - Best")
-    print("[2] MP4 - 1080p")
-    print("[3] MP4 - 720p")
-    print("[4] MP4 - 480p")
-    print("[5] MP3 - Best Audio")
-    print()
-
-    choice = input("Select [1-5]: ").strip()
-
-    formats = {
-
-        "1": {
-            "name": "MP4 Best",
-
-            "format": (
-                "bv*[ext=mp4]+ba[ext=m4a]"
-                "/b[ext=mp4]"
-                "/bv*+ba/b"
-            ),
-
-            "type": "video",
-        },
-
-        "2": {
-            "name": "MP4 1080p",
-
-            "format": (
-                "bv*[height<=1080][ext=mp4]+ba[ext=m4a]"
-                "/b[height<=1080][ext=mp4]"
-                "/bv*[height<=1080]+ba/b[height<=1080]"
-            ),
-
-            "type": "video",
-        },
-
-        "3": {
-            "name": "MP4 720p",
-
-            "format": (
-                "bv*[height<=720][ext=mp4]+ba[ext=m4a]"
-                "/b[height<=720][ext=mp4]"
-                "/bv*[height<=720]+ba/b[height<=720]"
-            ),
-
-            "type": "video",
-        },
-
-        "4": {
-            "name": "MP4 480p",
-
-            "format": (
-                "bv*[height<=480][ext=mp4]+ba[ext=m4a]"
-                "/b[height<=480][ext=mp4]"
-                "/bv*[height<=480]+ba/b[height<=480]"
-            ),
-
-            "type": "video",
-        },
-
-        "5": {
-            "name": "MP3",
-
-            "format": "bestaudio/best",
-
-            "type": "audio",
-        },
-    }
-
-    return formats.get(choice)
-
-
-# ============================================================
-# PROGRESS
-# ============================================================
-
-def progress_hook(data):
-    status = data.get("status")
-
-    if status == "downloading":
-
-        percent = data.get("_percent_str", "").strip()
-        speed = data.get("_speed_str", "").strip()
-        eta = data.get("_eta_str", "").strip()
-
-        message = f"\r[DOWNLOAD] {percent}"
+            message += (
+                " / "
+                + format_bytes(total)
+            )
 
         if speed:
-            message += f" | {speed}"
 
-        if eta:
-            message += f" | ETA {eta}"
+            message += (
+                " | "
+                + format_bytes(speed)
+                + "/s"
+            )
+
+        if eta is not None:
+
+            message += (
+                f" | ETA {eta}s"
+            )
 
         print(
             message,
             end="",
-            flush=True
+            flush=True,
         )
 
-    elif status == "finished":
+    elif (
+        data["status"]
+        == "finished"
+    ):
 
         print()
-        print("[PROCESS] Download finished.")
-        print("[PROCESS] Processing media...")
+
+        print(
+            "[DOWNLOAD] 100.0%"
+        )
 
 
 # ============================================================
-# DOWNLOAD
+# CLI
 # ============================================================
 
-def download_media(url, selected):
-    DOWNLOAD_DIR.mkdir(
-        parents=True,
-        exist_ok=True
+def print_header():
+
+    print()
+
+    print(
+        "=" * 58
     )
 
-    output_template = str(
-        DOWNLOAD_DIR
-        / "%(title).180B [%(id)s].%(ext)s"
+    print(
+        f"                  "
+        f"{APP_NAME} v{VERSION}"
     )
 
-    options = {
-        "format": selected["format"],
+    print(
+        "          Rewind the web. Keep the media."
+    )
 
-        "outtmpl": output_template,
+    print(
+        "=" * 58
+    )
 
-        "noplaylist": True,
+    print()
 
-        "windowsfilenames": True,
 
-        "progress_hooks": [
-            progress_hook
-        ],
-    }
+def show_profiles():
 
-    # --------------------------------------------------------
-    # MP4
-    # --------------------------------------------------------
+    print()
+    print("Available formats")
+    print("-" * 40)
 
-    if selected["type"] == "video":
-
-        options["merge_output_format"] = "mp4"
-
-    # --------------------------------------------------------
-    # MP3
-    # --------------------------------------------------------
-
-    elif selected["type"] == "audio":
-
-        options["postprocessors"] = [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "0",
-            }
-        ]
-
-    try:
-
-        print()
-        print(
-            f"[OUTPUT] {selected['name']}"
-        )
+    for key, profile in (
+        DOWNLOAD_PROFILES.items()
+    ):
 
         print(
-            f"[SAVE]   {DOWNLOAD_DIR.resolve()}"
+            f"[{key}] "
+            f"{profile.name}"
         )
 
-        print()
-
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.download([url])
-
-        print()
-        print("=" * 55)
-        print("DOWNLOAD COMPLETE")
-        print("=" * 55)
-
-        return True
-
-    except Exception as error:
-
-        print()
-        print("=" * 55)
-        print("DOWNLOAD FAILED")
-        print("=" * 55)
-
-        print(error)
-
-        return False
+    print()
 
 
 # ============================================================
@@ -282,6 +222,16 @@ def main():
 
     print_header()
 
+    downloader = RetroRipDownloader(
+        output_dir="downloads",
+
+        progress_callback=
+            progress_callback,
+
+        status_callback=
+            status_callback,
+    )
+
     url = input(
         "Paste media URL: "
     ).strip()
@@ -289,79 +239,99 @@ def main():
     if not url:
 
         print(
-            "[ERROR] No URL provided."
+            "[ERROR] URL is empty."
         )
 
         return
 
-    print()
-    print(
-        "[INFO] Reading media information..."
-    )
+    # ========================================================
+    # FETCH INFO
+    # ========================================================
 
-    info = get_media_info(url)
+    try:
 
-    if not info:
-        return
+        media = downloader.get_info(
+            url
+        )
 
-    title = info.get(
-        "title",
-        "Unknown"
-    )
-
-    uploader = (
-        info.get("uploader")
-        or info.get("channel")
-        or info.get("creator")
-        or "Unknown"
-    )
-
-    extractor = info.get(
-        "extractor_key",
-        "Unknown"
-    )
-
-    duration = format_duration(
-        info.get("duration")
-    )
-
-    print()
-    print("=" * 55)
-    print("MEDIA FOUND")
-    print("=" * 55)
-
-    print(
-        f"Title    : {title}"
-    )
-
-    print(
-        f"Creator  : {uploader}"
-    )
-
-    print(
-        f"Platform : {extractor}"
-    )
-
-    print(
-        f"Duration : {duration}"
-    )
-
-    print("=" * 55)
-
-    selected = select_format()
-
-    if selected is None:
+    except Exception as error:
 
         print()
         print(
-            "[ERROR] Invalid option."
+            "[ERROR] Could not read URL."
+        )
+
+        print(error)
+
+        return
+
+    print()
+
+    print(
+        "=" * 58
+    )
+
+    print(
+        "MEDIA FOUND"
+    )
+
+    print(
+        "=" * 58
+    )
+
+    print(
+        f"Title    : "
+        f"{media.title}"
+    )
+
+    print(
+        f"Creator  : "
+        f"{media.creator}"
+    )
+
+    print(
+        f"Platform : "
+        f"{media.platform}"
+    )
+
+    print(
+        f"Duration : "
+        f"{format_duration(media.duration)}"
+    )
+
+    print(
+        "=" * 58
+    )
+
+    # ========================================================
+    # PROFILE SELECT
+    # ========================================================
+
+    show_profiles()
+
+    choice = input(
+        "Select [1-5]: "
+    ).strip()
+
+    profile = (
+        DOWNLOAD_PROFILES.get(
+            choice
+        )
+    )
+
+    if profile is None:
+
+        print(
+            "[ERROR] Invalid selection."
         )
 
         return
 
     print()
+
     print(
-        f"Selected: {selected['name']}"
+        f"Selected: "
+        f"{profile.name}"
     )
 
     confirm = input(
@@ -371,7 +341,7 @@ def main():
     if confirm not in (
         "",
         "y",
-        "yes"
+        "yes",
     ):
 
         print(
@@ -380,23 +350,68 @@ def main():
 
         return
 
-    download_media(
-        url,
-        selected
+    # ========================================================
+    # DOWNLOAD
+    # ========================================================
+
+    try:
+
+        downloader.download(
+            url,
+            profile,
+        )
+
+    except Exception as error:
+
+        print()
+        print()
+
+        print(
+            "=" * 58
+        )
+
+        print(
+            "DOWNLOAD FAILED"
+        )
+
+        print(
+            "=" * 58
+        )
+
+        print(error)
+
+        return
+
+    print()
+    print()
+
+    print(
+        "=" * 58
+    )
+
+    print(
+        "DOWNLOAD COMPLETE"
+    )
+
+    print(
+        "=" * 58
     )
 
 
 if __name__ == "__main__":
 
     try:
+
         main()
 
     except KeyboardInterrupt:
 
         print()
         print()
+
         print(
-            "[STOP] RetroRip interrupted."
+            "[STOP] "
+            "RetroRip interrupted."
         )
 
         sys.exit(0)
