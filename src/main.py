@@ -25,7 +25,7 @@ from downloader import DownloadCancelled, MediaInfo, RetroRipDownloader, create_
 
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = Path(__file__).resolve().parent / "assets"
-VERSION = "0.7"
+VERSION = "0.7.1"
 
 
 def duration_text(seconds):

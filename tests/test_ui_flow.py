@@ -89,6 +89,32 @@ class FlowTests(unittest.TestCase):
         self.assertIsNone(w.media)
         self.assertEqual(w.scene.saved_count,1)
 
+    def test_another_tape_restores_clean_scene_after_repeated_recordings(self):
+        w = self.window
+        w.scene.timer.stop()
+
+        def snapshot():
+            w.scene.phase = 0
+            w.scene.angle = 0
+            w.scene.update()
+            APP.processEvents()
+            return w.scene.grab().toImage()
+
+        fresh_scene = snapshot()
+        for count in (1, 2):
+            self.load(f"Tape {count}")
+            self.start()
+            w.on_success()
+            self.transition()
+            w.keep_tape()
+            self.transition()
+            self.assertEqual(w.state, "archived")
+            w.new_tape()
+            self.assertEqual(w.state, "idle")
+            self.assertEqual(w.scene.saved_count, count)
+            self.assertEqual(snapshot(), fresh_scene,
+                             "Previous sleeve overlaps the next tape's landing scene")
+
     def test_cancel_during_insertion_never_starts_download(self):
         self.load()
         w=self.window

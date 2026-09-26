@@ -378,7 +378,9 @@ class DeckScene(QWidget):
         p.restore()
 
     def draw_sleeve(self,p,front=False):
-        visible = self.mode in ("ejecting","complete","stopped","archiving","archived") or self.saved_count > 0
+        # Archive count is session history, not a reason to keep the old
+        # sleeve on the stage while making another tape.
+        visible = self.mode in ("ejecting","complete","stopped","archiving","archived")
         if not visible:
             return
         p.save()
@@ -403,7 +405,7 @@ class DeckScene(QWidget):
             p.setPen(QPen(color("#c6b596"), .6))
             p.drawLine(QPointF(-118,-43),QPointF(-118,76))
             p.drawLine(QPointF(118,-43),QPointF(118,76))
-            if self.mode == "archived" or (self.saved_count and self.mode not in ("complete","ejecting","archiving","stopped")):
+            if self.mode == "archived":
                 artwork(p,QRectF(-101,-27,55,49),self.saved_cover)
                 label(p,-34,-9,self.saved_title,11,"#2f4440",True,width=139)
                 label(p,-34,11,f"TAPE {self.saved_count:03d}",9,"#756954",mono=True)
