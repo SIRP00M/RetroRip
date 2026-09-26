@@ -1,1181 +1,580 @@
+"""RetroRip cassette deck UI. Run: python src/main.py"""
+import math
 import os
 import sys
+from pathlib import Path
+from threading import Event
+from urllib.request import Request, urlopen
 
-from PySide6.QtCore import (
-    QObject,
-    QThread,
-    Signal,
-    Slot,
-    Qt,
-    QUrl,
-)
-
-from PySide6.QtGui import (
-    QDesktopServices,
-)
-
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal, Slot
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtMultimedia import QSoundEffect
 from PySide6.QtWidgets import (
-    QApplication,
-    QComboBox,
-    QFileDialog,
-    QFormLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QSizePolicy, QVBoxLayout, QWidget,
 )
-
-from downloader import (
-    RetroRipDownloader,
-    create_video_profile,
-    create_audio_profile,
-)
-
+from downloader import DownloadCancelled, RetroRipDownloader, create_audio_profile, create_video_profile
 
 APP_NAME = "RetroRip"
-VERSION = "0.5"
+VERSION = "0.6"
+ASSETS = Path(__file__).resolve().parent / "assets"
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def format_duration(seconds):
+def duration_text(seconds):
     if seconds is None:
-        return "Unknown"
-
+        return "—"
     seconds = int(seconds)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02}:{minutes:02}:{secs:02}" if hours else f"{minutes:02}:{secs:02}"
 
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    secs = seconds % 60
-
-    if hours:
-        return f"{hours:02}:{minutes:02}:{secs:02}"
-
-    return f"{minutes:02}:{secs:02}"
-
-
-# ============================================================
-# INFO WORKER
-# ============================================================
 
 class InfoWorker(QObject):
-
-    finished = Signal(object)
+    result = Signal(object, bytes)
     error = Signal(str)
     status = Signal(str)
 
     def __init__(self, url):
         super().__init__()
-
         self.url = url
 
     @Slot()
     def run(self):
         try:
-            downloader = RetroRipDownloader(
-                status_callback=self.status.emit
-            )
+            media = RetroRipDownloader(status_callback=self.status.emit).get_info(self.url)
+            picture = b""
+            if media.thumbnail_url and media.thumbnail_url.startswith(("https://", "http://")):
+                try:
+                    request = Request(media.thumbnail_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urlopen(request, timeout=6) as response:
+                        if response.headers.get_content_type().startswith("image/"):
+                            picture = response.read(2_000_001)
+                            if len(picture) > 2_000_000:
+                                picture = b""
+                except Exception:
+                    pass  # Artwork is optional; metadata remains usable.
+            self.result.emit(media, picture)
+        except Exception as exc:
+            self.error.emit(str(exc))
 
-            media = downloader.get_info(
-                self.url
-            )
-
-            self.finished.emit(
-                media
-            )
-
-        except Exception as error:
-            self.error.emit(
-                str(error)
-            )
-
-
-# ============================================================
-# DOWNLOAD WORKER
-# ============================================================
 
 class DownloadWorker(QObject):
-
-    progress = Signal(int)
+    progress = Signal(float)
     status = Signal(str)
-
-    finished = Signal()
+    complete = Signal()
+    cancelled = Signal()
     error = Signal(str)
 
-    def __init__(
-        self,
-        url,
-        profile,
-        output_dir,
-    ):
+    def __init__(self, url, profile, folder, cancel_event):
         super().__init__()
+        self.url, self.profile, self.folder = url, profile, folder
+        self.cancel_event = cancel_event
 
-        self.url = url
-        self.profile = profile
-        self.output_dir = output_dir
-
-    def progress_callback(self, data):
-
-        status = data.get(
-            "status"
-        )
-
-        if status == "downloading":
-
-            percent = data.get(
-                "percent"
-            )
-
-            if percent is not None:
-                self.progress.emit(
-                    int(percent)
-                )
-
-        elif status == "finished":
-
-            self.progress.emit(
-                100
-            )
+    def on_progress(self, data):
+        if data.get("status") == "downloading" and data.get("percent") is not None:
+            self.progress.emit(max(0, min(100, float(data["percent"]))))
+        elif data.get("status") == "finished":
+            self.progress.emit(100)
 
     @Slot()
     def run(self):
         try:
-
-            downloader = RetroRipDownloader(
-                output_dir=self.output_dir,
-
-                progress_callback=
-                    self.progress_callback,
-
-                status_callback=
-                    self.status.emit,
+            engine = RetroRipDownloader(
+                output_dir=self.folder, progress_callback=self.on_progress,
+                status_callback=self.status.emit, cancel_event=self.cancel_event,
             )
-
-            downloader.download(
-                self.url,
-                self.profile,
-            )
-
-            self.finished.emit()
-
-        except Exception as error:
-
-            self.error.emit(
-                str(error)
-            )
+            engine.download(self.url, self.profile)
+            self.complete.emit()
+        except Exception as exc:
+            if self.cancel_event.is_set() or isinstance(exc, DownloadCancelled):
+                self.cancelled.emit()
+            else:
+                self.error.emit(str(exc))
 
 
-# ============================================================
-# MAIN WINDOW
-# ============================================================
-
-class RetroRipWindow(QMainWindow):
-
+class Cassette(QWidget):
+    """Vector drawn tape. Animation updates only the reel angle and LED."""
     def __init__(self):
         super().__init__()
+        self.setMinimumHeight(355)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.angle = 0.0
+        self.moving = False
+        self.active = False
+        self.progress = 0.0
+        self.title = "NO TAPE LOADED"
+        self.subtitle = "PASTE A LINK  /  PRESS ANALYZE"
+        self.cover = QPixmap()
+        self.phase = 0.0
+        self.timer = QTimer(self)
+        self.timer.setInterval(30)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start()
 
+    def tick(self):
+        self.phase += .09
+        if self.moving:
+            self.angle = (self.angle + (4.5 if self.active else 2.2)) % 360
+        self.update()
+
+    def set_media(self, media=None, picture=b""):
+        self.cover = QPixmap()
+        if media:
+            self.title = media.title.upper()
+            self.subtitle = f"{media.platform.upper()}   /   {duration_text(media.duration)}"
+            if picture:
+                self.cover.loadFromData(picture)
+        else:
+            self.title = "NO TAPE LOADED"
+            self.subtitle = "PASTE A LINK  /  PRESS ANALYZE"
+        self.progress = 0.0
+        self.update()
+
+    @staticmethod
+    def rounded(painter, x, y, w, h, radius, fill, stroke=None, width=1):
+        painter.setPen(QPen(QColor(stroke), width) if stroke else Qt.NoPen)
+        painter.setBrush(QColor(fill) if isinstance(fill, str) else fill)
+        painter.drawRoundedRect(x, y, w, h, radius, radius)
+
+    def reel(self, painter, x, y, rotation, radius, accent):
+        painter.save()
+        painter.translate(x, y)
+        painter.setPen(QPen(QColor("#0e1014"), 9))
+        painter.setBrush(QColor("#171b22"))
+        painter.drawEllipse(-radius, -radius, radius * 2, radius * 2)
+        painter.setPen(QPen(QColor("#52575a"), 2))
+        painter.setBrush(QColor("#a0a9a3"))
+        painter.drawEllipse(-radius + 8, -radius + 8, (radius - 8) * 2, (radius - 8) * 2)
+        painter.rotate(rotation)
+        for n in range(6):
+            painter.save()
+            painter.rotate(n * 60)
+            path = QPainterPath()
+            path.addRoundedRect(-7, -radius + 15, 14, 24, 5, 5)
+            painter.fillPath(path, QColor("#252b2c"))
+            painter.restore()
+        painter.setBrush(QColor(accent))
+        painter.setPen(QPen(QColor("#444a46"), 2))
+        painter.drawEllipse(-16, -16, 32, 32)
+        painter.setBrush(QColor("#24272a"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(-6, -6, 12, 12)
+        painter.restore()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        scale = min((self.width() - 8) / 780, (self.height() - 8) / 372)
+        p.translate((self.width() - 780 * scale) / 2, (self.height() - 372 * scale) / 2)
+        p.scale(scale, scale)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#080d12"))
+        p.drawRoundedRect(5, 8, 770, 354, 22, 22)
+        face = QLinearGradient(0, 13, 0, 350)
+        face.setColorAt(0, QColor("#424954"))
+        face.setColorAt(.22, QColor("#202832"))
+        face.setColorAt(1, QColor("#131b25"))
+        self.rounded(p, 12, 12, 756, 344, 18, face, "#727779", 2)
+        self.rounded(p, 32, 27, 716, 255, 12, "#d1c8b0", "#121d25", 3)
+        self.rounded(p, 47, 38, 686, 25, 3, "#db5537")
+        p.setFont(QFont("Consolas", 10, QFont.Bold))
+        p.setPen(QColor("#f6e8cc"))
+        p.drawText(61, 56, "R E T R O R I P     /     MAGNETIC MEDIA SYSTEM")
+        self.rounded(p, 47, 76, 686, 97, 6, "#eee5d0")
+        if not self.cover.isNull():
+            cropped = self.cover.scaled(148, 84, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            p.save()
+            p.setClipRect(57, 83, 148, 84)
+            p.drawPixmap(57, 83, cropped)
+            p.restore()
+        else:
+            self.rounded(p, 57, 83, 148, 84, 3, "#263746")
+            p.setFont(QFont("Consolas", 25, QFont.Bold))
+            p.setPen(QColor("#e3744e"))
+            p.drawText(90, 137, "RR / 90")
+        p.setPen(QColor("#17212a"))
+        p.setFont(QFont("Consolas", 13, QFont.Bold))
+        title = p.fontMetrics().elidedText(self.title, Qt.ElideRight, 496)
+        p.drawText(220, 112, title)
+        p.setFont(QFont("Consolas", 10))
+        p.setPen(QColor("#68665c"))
+        p.drawText(220, 137, self.subtitle[:85])
+        self.rounded(p, 48, 184, 684, 82, 15, "#141b23", "#747569", 2)
+        self.rounded(p, 277, 188, 226, 73, 8, "#232b31", "#696e6c", 2)
+        p.setPen(QPen(QColor("#12100e"), 7))
+        p.drawLine(275, 224, 503, 224)
+        self.reel(p, 189, 226, self.angle, 38, "#c3bdab")
+        self.reel(p, 591, 226, self.angle * .95, 38, "#c3bdab")
+        for x in (62, 718):
+            for y in (89, 268):
+                p.setPen(QPen(QColor("#393d3d"), 3))
+                p.setBrush(QColor("#a9aca5"))
+                p.drawEllipse(x-5, y-5, 10, 10)
+                p.drawLine(x-3, y-3, x+3, y+3)
+        p.setPen(QColor("#d7c9a7"))
+        p.setFont(QFont("Consolas", 11, QFont.Bold))
+        p.drawText(49, 320, "TYPE I     •     STEREO")
+        p.drawText(620, 320, "SIDE  A  /  01")
+        p.fillRect(305, 298, int(170 * self.progress / 100), 6, QColor("#e57146"))
+        p.setPen(QColor("#56616a"))
+        p.drawRect(304, 297, 171, 7)
+        p.end()
+
+
+class RetroRipWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
         self.media = None
+        self.loaded_url = ""
         self.profiles = []
+        self.info_thread = self.info_worker = None
+        self.download_thread = self.download_worker = None
+        self.stop_flag = None
+        self.output_folder = os.path.abspath("downloads")
+        self.setWindowTitle(f"{APP_NAME}  /  CASSETTE DECK")
+        self.setMinimumSize(810, 740)
+        self.resize(990, 830)
+        self.sound = QSoundEffect(self)
+        self.sound.setSource(QUrl.fromLocalFile(str(ASSETS / "clack.wav")))
+        self.sound.setVolume(.34)
+        self.make_ui()
+        self.setStyleSheet(STYLE)
+        self.anim = QTimer(self)
+        self.anim.timeout.connect(self.animate)
+        self.anim.start(30)
+        self.target_progress = 0.0
+        self.display_progress = 0.0
+        self.processing = False
+        self.busy = False
+        self.refresh_buttons()
 
-        self.current_url = None
-
-        self.info_thread = None
-        self.info_worker = None
-
-        self.download_thread = None
-        self.download_worker = None
-
-        self.output_folder = os.path.abspath(
-            "downloads"
-        )
-
-        self.setWindowTitle(
-            f"{APP_NAME} v{VERSION}"
-        )
-
-        self.resize(
-            760,
-            560
-        )
-
-        self.build_ui()
-        self.apply_style()
-
-    # ========================================================
-    # UI
-    # ========================================================
-
-    def build_ui(self):
-
-        central = QWidget()
-
-        self.setCentralWidget(
-            central
-        )
-
-        layout = QVBoxLayout(
-            central
-        )
-
-        layout.setContentsMargins(
-            35,
-            30,
-            35,
-            30,
-        )
-
-        layout.setSpacing(
-            15
-        )
-
-        # ----------------------------------------------------
-        # TITLE
-        # ----------------------------------------------------
-
-        title = QLabel(
-            "RETRO RIP"
-        )
-
-        title.setObjectName(
-            "title"
-        )
-
-        title.setAlignment(
-            Qt.AlignCenter
-        )
-
-        subtitle = QLabel(
-            "Rewind the web. Keep the media."
-        )
-
-        subtitle.setObjectName(
-            "subtitle"
-        )
-
-        subtitle.setAlignment(
-            Qt.AlignCenter
-        )
-
-        layout.addWidget(
-            title
-        )
-
-        layout.addWidget(
-            subtitle
-        )
-
-        # ----------------------------------------------------
-        # URL
-        # ----------------------------------------------------
+    def make_ui(self):
+        shell = QWidget()
+        self.setCentralWidget(shell)
+        root = QVBoxLayout(shell)
+        root.setContentsMargins(35, 25, 35, 24)
+        root.setSpacing(15)
+        top = QHBoxLayout()
+        brand = QLabel("◉   R E T R O R I P")
+        brand.setObjectName("brand")
+        top.addWidget(brand)
+        top.addStretch()
+        edition = QLabel("DECK 01   /   DIGITAL TO ANALOG")
+        edition.setObjectName("minor")
+        top.addWidget(edition)
+        root.addLayout(top)
 
         url_row = QHBoxLayout()
-
         self.url_input = QLineEdit()
+        self.url_input.setPlaceholderText("PASTE A YOUTUBE  /  TIKTOK  /  FACEBOOK LINK")
+        self.url_input.returnPressed.connect(self.analyze)
+        self.url_input.textChanged.connect(self.url_changed)
+        self.analyze_btn = QPushButton("LOAD TAPE   ↗")
+        self.analyze_btn.setObjectName("secondary")
+        self.analyze_btn.clicked.connect(self.analyze)
+        url_row.addWidget(self.url_input, 1)
+        url_row.addWidget(self.analyze_btn)
+        root.addLayout(url_row)
 
-        self.url_input.setPlaceholderText(
-            "Paste YouTube / TikTok / Facebook URL..."
-        )
+        deck = QFrame()
+        deck.setObjectName("deck")
+        deck_layout = QVBoxLayout(deck)
+        deck_layout.setContentsMargins(17, 15, 17, 12)
+        top_line = QHBoxLayout()
+        self.led = QLabel("●   STANDBY")
+        self.led.setObjectName("led")
+        top_line.addWidget(self.led)
+        top_line.addStretch()
+        top_line.addWidget(QLabel("AUTO REVERSE   /   HI-FI  STEREO"))
+        deck_layout.addLayout(top_line)
+        self.cassette = Cassette()
+        deck_layout.addWidget(self.cassette, 1)
+        root.addWidget(deck, 1)
 
-        self.url_input.textChanged.connect(
-            self.url_changed
-        )
+        details = QHBoxLayout()
+        self.meta_label = QLabel("NO MEDIA LOADED  •  INSERT A LINK TO BEGIN")
+        self.meta_label.setObjectName("meta")
+        self.meta_label.setWordWrap(True)
+        details.addWidget(self.meta_label, 1)
+        self.quality = QComboBox()
+        self.quality.setMinimumWidth(235)
+        self.quality.setEnabled(False)
+        details.addWidget(self.quality)
+        root.addLayout(details)
 
-        self.analyze_button = QPushButton(
-            "ANALYZE"
-        )
+        progress_row = QHBoxLayout()
+        progress_row.addWidget(QLabel("TAPE POSITION"))
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setRange(0, 1000)
+        progress_row.addWidget(self.progress_bar, 1)
+        self.percent_label = QLabel("00.0 %")
+        self.percent_label.setObjectName("digits")
+        progress_row.addWidget(self.percent_label)
+        root.addLayout(progress_row)
 
-        self.analyze_button.clicked.connect(
-            self.analyze_url
-        )
+        self.status = QLabel("AWAITING INPUT")
+        self.status.setObjectName("status")
+        root.addWidget(self.status)
 
-        url_row.addWidget(
-            self.url_input
-        )
-
-        url_row.addWidget(
-            self.analyze_button
-        )
-
-        layout.addLayout(
-            url_row
-        )
-
-        # ----------------------------------------------------
-        # MEDIA INFORMATION
-        # ----------------------------------------------------
-
-        form = QFormLayout()
-
-        self.title_value = QLabel(
-            "-"
-        )
-
-        self.creator_value = QLabel(
-            "-"
-        )
-
-        self.platform_value = QLabel(
-            "-"
-        )
-
-        self.duration_value = QLabel(
-            "-"
-        )
-
-        self.resolution_value = QLabel(
-            "-"
-        )
-
-        self.title_value.setWordWrap(
-            True
-        )
-
-        form.addRow(
-            "Title:",
-            self.title_value,
-        )
-
-        form.addRow(
-            "Creator:",
-            self.creator_value,
-        )
-
-        form.addRow(
-            "Platform:",
-            self.platform_value,
-        )
-
-        form.addRow(
-            "Duration:",
-            self.duration_value,
-        )
-
-        form.addRow(
-            "Available:",
-            self.resolution_value,
-        )
-
-        layout.addLayout(
-            form
-        )
-
-        # ----------------------------------------------------
-        # QUALITY
-        # ----------------------------------------------------
-
-        quality_row = QHBoxLayout()
-
-        quality_label = QLabel(
-            "Format / Quality"
-        )
-
-        self.quality_combo = QComboBox()
-
-        self.quality_combo.setEnabled(
-            False
-        )
-
-        quality_row.addWidget(
-            quality_label
-        )
-
-        quality_row.addWidget(
-            self.quality_combo,
-            1,
-        )
-
-        layout.addLayout(
-            quality_row
-        )
-
-        # ----------------------------------------------------
-        # OUTPUT FOLDER
-        # ----------------------------------------------------
+        controls = QHBoxLayout()
+        self.rec_btn = QPushButton("●   REC")
+        self.rec_btn.setObjectName("rec")
+        self.rec_btn.clicked.connect(self.record)
+        self.stop_btn = QPushButton("■   STOP")
+        self.stop_btn.clicked.connect(self.stop)
+        self.eject_btn = QPushButton("⏏   EJECT")
+        self.eject_btn.clicked.connect(self.eject)
+        for button in (self.rec_btn, self.stop_btn, self.eject_btn):
+            button.setMinimumHeight(53)
+            controls.addWidget(button, 1)
+        root.addLayout(controls)
 
         folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("OUTPUT   /"))
+        self.folder_label = QLabel(self.output_folder)
+        self.folder_label.setObjectName("path")
+        folder_row.addWidget(self.folder_label, 1)
+        browse = QPushButton("CHANGE")
+        browse.clicked.connect(self.choose_folder)
+        self.browse_btn = browse
+        folder_row.addWidget(browse)
+        open_btn = QPushButton("OPEN ↗")
+        open_btn.clicked.connect(self.open_folder)
+        folder_row.addWidget(open_btn)
+        root.addLayout(folder_row)
 
-        self.folder_input = QLineEdit(
-            self.output_folder
-        )
+    def click(self):
+        if self.sound.isLoaded():
+            self.sound.stop()
+            self.sound.play()
 
-        self.folder_input.setReadOnly(
-            True
-        )
+    def animate(self):
+        if abs(self.target_progress - self.display_progress) > .03:
+            self.display_progress += (self.target_progress - self.display_progress) * .16
+        else:
+            self.display_progress = self.target_progress
+        self.progress_bar.setValue(round(self.display_progress * 10))
+        self.cassette.progress = self.display_progress
+        self.percent_label.setText(f"{self.display_progress:04.1f} %")
+        if self.busy and self.cassette.moving:
+            self.led.setStyleSheet("color: #ff704b" if math.sin(self.cassette.phase * 3) > 0 else "color: #824e42")
+        else:
+            self.led.setStyleSheet("color: #86b89b" if self.media else "color: #777d80")
 
-        self.browse_button = QPushButton(
-            "BROWSE"
-        )
-
-        self.browse_button.clicked.connect(
-            self.choose_folder
-        )
-
-        self.open_button = QPushButton(
-            "OPEN"
-        )
-
-        self.open_button.clicked.connect(
-            self.open_folder
-        )
-
-        folder_row.addWidget(
-            self.folder_input,
-            1,
-        )
-
-        folder_row.addWidget(
-            self.browse_button
-        )
-
-        folder_row.addWidget(
-            self.open_button
-        )
-
-        layout.addLayout(
-            folder_row
-        )
-
-        # ----------------------------------------------------
-        # PROGRESS
-        # ----------------------------------------------------
-
-        self.progress_bar = QProgressBar()
-
-        self.progress_bar.setRange(
-            0,
-            100
-        )
-
-        self.progress_bar.setValue(
-            0
-        )
-
-        self.progress_bar.setFormat(
-            "%p%"
-        )
-
-        layout.addWidget(
-            self.progress_bar
-        )
-
-        # ----------------------------------------------------
-        # STATUS
-        # ----------------------------------------------------
-
-        self.status_label = QLabel(
-            "Ready"
-        )
-
-        self.status_label.setObjectName(
-            "status"
-        )
-
-        self.status_label.setAlignment(
-            Qt.AlignCenter
-        )
-
-        layout.addWidget(
-            self.status_label
-        )
-
-        # ----------------------------------------------------
-        # DOWNLOAD
-        # ----------------------------------------------------
-
-        self.download_button = QPushButton(
-            "DOWNLOAD"
-        )
-
-        self.download_button.setObjectName(
-            "download"
-        )
-
-        self.download_button.setEnabled(
-            False
-        )
-
-        self.download_button.clicked.connect(
-            self.start_download
-        )
-
-        layout.addWidget(
-            self.download_button
-        )
-
-    # ========================================================
-    # URL CHANGED
-    # ========================================================
+    def refresh_buttons(self):
+        analyzing = self.info_thread is not None
+        downloading = self.download_thread is not None
+        self.analyze_btn.setEnabled(not analyzing and not downloading)
+        self.url_input.setEnabled(not downloading)
+        self.quality.setEnabled(bool(self.media) and not downloading)
+        self.rec_btn.setEnabled(bool(self.media) and not analyzing and not downloading)
+        self.stop_btn.setEnabled(downloading and self.stop_flag is not None and not self.stop_flag.is_set())
+        self.eject_btn.setEnabled(not analyzing and not downloading and bool(self.media or self.url_input.text()))
+        self.browse_btn.setEnabled(not downloading)
 
     def url_changed(self):
+        if self.media and self.url_input.text().strip() != self.loaded_url:
+            self.clear_media()
+            self.status.setText("NEW LINK DETECTED  /  PRESS LOAD TAPE")
+        self.refresh_buttons()
 
-        url = self.url_input.text().strip()
-
-        if (
-            self.current_url
-            and url != self.current_url
-        ):
-
-            self.media = None
-            self.profiles.clear()
-
-            self.quality_combo.clear()
-
-            self.quality_combo.setEnabled(
-                False
-            )
-
-            self.download_button.setEnabled(
-                False
-            )
-
-            self.title_value.setText("-")
-            self.creator_value.setText("-")
-            self.platform_value.setText("-")
-            self.duration_value.setText("-")
-            self.resolution_value.setText("-")
-
-            self.status_label.setText(
-                "URL changed — analyze again"
-            )
-
-    # ========================================================
-    # ANALYZE
-    # ========================================================
-
-    def analyze_url(self):
-
-        url = self.url_input.text().strip()
-
-        if not url:
-
-            QMessageBox.warning(
-                self,
-                "RetroRip",
-                "Paste a media URL first.",
-            )
-
-            return
-
-        if self.info_thread is not None:
-            return
-
-        self.current_url = None
+    def clear_media(self):
         self.media = None
-
+        self.loaded_url = ""
         self.profiles.clear()
-        self.quality_combo.clear()
+        self.quality.clear()
+        self.meta_label.setText("NO MEDIA LOADED  •  INSERT A LINK TO BEGIN")
+        self.cassette.set_media()
+        self.target_progress = self.display_progress = 0
+        self.processing = False
+        self.refresh_buttons()
 
-        self.download_button.setEnabled(
-            False
-        )
+    def analyze(self):
+        url = self.url_input.text().strip()
+        if not url or self.info_thread or self.download_thread:
+            if not url:
+                self.status.setText("PASTE A LINK FIRST")
+            return
+        self.click()
+        self.clear_media()
+        self.busy = True
+        self.cassette.moving = True
+        self.cassette.active = False
+        self.status.setText("READING TAPE LABEL...")
+        thread = QThread(self)
+        worker = InfoWorker(url)
+        worker.moveToThread(thread)
+        self.info_thread, self.info_worker = thread, worker
+        thread.started.connect(worker.run)
+        worker.result.connect(lambda media, pic: self.media_ready(url, media, pic))
+        worker.error.connect(self.info_error)
+        worker.result.connect(thread.quit)
+        worker.error.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.info_done)
+        thread.start()
+        self.refresh_buttons()
 
-        self.quality_combo.setEnabled(
-            False
-        )
-
-        self.analyze_button.setEnabled(
-            False
-        )
-
-        self.status_label.setText(
-            "Analyzing media..."
-        )
-
-        # ----------------------------------------------------
-        # THREAD
-        # ----------------------------------------------------
-
-        self.info_thread = QThread()
-
-        self.info_worker = InfoWorker(
-            url
-        )
-
-        self.info_worker.moveToThread(
-            self.info_thread
-        )
-
-        self.info_thread.started.connect(
-            self.info_worker.run
-        )
-
-        self.info_worker.status.connect(
-            self.status_label.setText
-        )
-
-        self.info_worker.finished.connect(
-            self.media_ready
-        )
-
-        self.info_worker.error.connect(
-            self.media_error
-        )
-
-        self.info_worker.finished.connect(
-            self.info_thread.quit
-        )
-
-        self.info_worker.error.connect(
-            self.info_thread.quit
-        )
-
-        self.info_thread.finished.connect(
-            self.info_worker.deleteLater
-        )
-
-        self.info_thread.finished.connect(
-            self.info_thread.deleteLater
-        )
-
-        self.info_thread.finished.connect(
-            self.info_thread_finished
-        )
-
-        self.info_thread.start()
-
-    # ========================================================
-    # MEDIA READY
-    # ========================================================
-
-    def media_ready(
-        self,
-        media,
-    ):
-
+    def media_ready(self, requested_url, media, picture):
+        self.busy = self.cassette.moving = False
+        if self.url_input.text().strip() != requested_url:
+            self.status.setText("LINK CHANGED  /  PRESS LOAD TAPE AGAIN")
+            return
         self.media = media
+        self.loaded_url = requested_url
+        self.cassette.set_media(media, picture)
+        self.profiles = [create_video_profile()]
+        self.profiles.extend(create_video_profile(h) for h in media.resolutions)
+        self.profiles.append(create_audio_profile())
+        self.quality.addItems([p.name for p in self.profiles])
+        self.meta_label.setText(f"{media.creator}    •    {media.platform}    •    {duration_text(media.duration)}")
+        self.status.setText("TAPE READY  /  SELECT QUALITY AND PRESS REC")
+        self.refresh_buttons()
 
-        self.current_url = (
-            self.url_input
-            .text()
-            .strip()
-        )
+    def info_error(self, error):
+        self.busy = self.cassette.moving = False
+        self.status.setText("COULD NOT LOAD TAPE")
+        QMessageBox.warning(self, "RetroRip • Analyze failed", error)
 
-        self.title_value.setText(
-            media.title
-        )
+    def info_done(self):
+        self.info_thread = self.info_worker = None
+        self.refresh_buttons()
 
-        self.creator_value.setText(
-            media.creator
-        )
+    def record(self):
+        if not self.media or self.download_thread:
+            return
+        self.click()
+        profile = self.profiles[self.quality.currentIndex()]
+        self.target_progress = self.display_progress = 0
+        self.processing = False
+        self.busy = self.cassette.moving = self.cassette.active = True
+        self.led.setText("●   RECORDING")
+        self.status.setText(f"RECORDING  /  {profile.name.upper()}")
+        self.stop_flag = Event()
+        thread = QThread(self)
+        worker = DownloadWorker(self.loaded_url, profile, self.output_folder, self.stop_flag)
+        worker.moveToThread(thread)
+        self.download_thread, self.download_worker = thread, worker
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.set_progress)
+        worker.status.connect(self.set_status)
+        worker.complete.connect(self.complete)
+        worker.cancelled.connect(self.cancelled)
+        worker.error.connect(self.download_error)
+        for signal in (worker.complete, worker.cancelled, worker.error):
+            signal.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.download_done)
+        thread.start()
+        self.refresh_buttons()
 
-        self.platform_value.setText(
-            media.platform
-        )
+    def set_progress(self, value):
+        self.target_progress = max(self.target_progress, value)
 
-        self.duration_value.setText(
-            format_duration(
-                media.duration
-            )
-        )
+    def set_status(self, value):
+        self.status.setText(value.upper())
+        if "Processing" in value or "processing" in value:
+            self.processing = True
+            self.cassette.active = False
+            self.led.setText("●   FINALIZING")
 
-        # ----------------------------------------------------
-        # RESOLUTIONS
-        # ----------------------------------------------------
+    def stop(self):
+        if self.stop_flag and self.download_thread and not self.stop_flag.is_set():
+            self.click()
+            self.stop_flag.set()  # Directly set thread-safe flag: worker event loop is busy.
+            self.status.setText("STOP REQUESTED  /  WAITING FOR CURRENT TRANSFER")
+            self.refresh_buttons()
 
-        if media.resolutions:
+    def complete(self):
+        self.target_progress = 100
+        self.busy = self.cassette.moving = False
+        self.led.setText("●   COMPLETE")
+        self.status.setText("RECORDING COMPLETE  /  FILE IN OUTPUT FOLDER")
+        self.click()
 
-            text = ", ".join(
-                f"{height}p"
-                for height
-                in media.resolutions
-            )
+    def cancelled(self):
+        self.busy = self.cassette.moving = False
+        self.led.setText("●   STOPPED")
+        self.status.setText("STOPPED  /  PARTIAL DOWNLOAD MAY REMAIN")
 
-            self.resolution_value.setText(
-                text
-            )
+    def download_error(self, error):
+        self.busy = self.cassette.moving = False
+        self.led.setText("●   ERROR")
+        self.status.setText("RECORDING FAILED")
+        QMessageBox.critical(self, "RetroRip • Download failed", error)
 
-        else:
+    def download_done(self):
+        self.download_thread = self.download_worker = self.stop_flag = None
+        self.refresh_buttons()
 
-            self.resolution_value.setText(
-                "Unknown"
-            )
-
-        # ----------------------------------------------------
-        # PROFILES
-        # ----------------------------------------------------
-
-        self.profiles = []
-
-        # Best
-        self.profiles.append(
-            create_video_profile()
-        )
-
-        # Dynamic resolutions
-        for height in media.resolutions:
-
-            self.profiles.append(
-                create_video_profile(
-                    height
-                )
-            )
-
-        # MP3
-        self.profiles.append(
-            create_audio_profile()
-        )
-
-        # ----------------------------------------------------
-        # COMBO BOX
-        # ----------------------------------------------------
-
-        self.quality_combo.clear()
-
-        for profile in self.profiles:
-
-            self.quality_combo.addItem(
-                profile.name
-            )
-
-        self.quality_combo.setEnabled(
-            True
-        )
-
-        self.download_button.setEnabled(
-            True
-        )
-
-        self.status_label.setText(
-            "Media ready"
-        )
-
-    # ========================================================
-    # MEDIA ERROR
-    # ========================================================
-
-    def media_error(
-        self,
-        error,
-    ):
-
-        self.status_label.setText(
-            "Analyze failed"
-        )
-
-        QMessageBox.critical(
-            self,
-            "Analyze Error",
-            error,
-        )
-
-    # ========================================================
-    # INFO THREAD FINISHED
-    # ========================================================
-
-    def info_thread_finished(self):
-
-        self.info_thread = None
-        self.info_worker = None
-
-        self.analyze_button.setEnabled(
-            True
-        )
-
-    # ========================================================
-    # OUTPUT DIRECTORY
-    # ========================================================
+    def eject(self):
+        if self.info_thread or self.download_thread:
+            return
+        self.click()
+        self.clear_media()
+        self.url_input.clear()
+        self.led.setText("●   STANDBY")
+        self.status.setText("TAPE EJECTED  /  AWAITING INPUT")
 
     def choose_folder(self):
-
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "Choose download folder",
-            self.output_folder,
-        )
-
+        folder = QFileDialog.getExistingDirectory(self, "Choose output folder", self.output_folder)
         if folder:
-
+            self.click()
             self.output_folder = folder
-
-            self.folder_input.setText(
-                folder
-            )
+            self.folder_label.setText(folder)
 
     def open_folder(self):
+        os.makedirs(self.output_folder, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_folder))
 
-        os.makedirs(
-            self.output_folder,
-            exist_ok=True,
-        )
-
-        QDesktopServices.openUrl(
-            QUrl.fromLocalFile(
-                self.output_folder
-            )
-        )
-
-    # ========================================================
-    # START DOWNLOAD
-    # ========================================================
-
-    def start_download(self):
-
-        if not self.media:
-            return
-
-        if not self.current_url:
-            return
-
-        if self.download_thread is not None:
-            return
-
-        index = (
-            self.quality_combo
-            .currentIndex()
-        )
-
-        if (
-            index < 0
-            or index >= len(
-                self.profiles
-            )
-        ):
-
-            return
-
-        profile = (
-            self.profiles[
-                index
-            ]
-        )
-
-        # ----------------------------------------------------
-        # UI LOCK
-        # ----------------------------------------------------
-
-        self.progress_bar.setValue(
-            0
-        )
-
-        self.download_button.setEnabled(
-            False
-        )
-
-        self.analyze_button.setEnabled(
-            False
-        )
-
-        self.quality_combo.setEnabled(
-            False
-        )
-
-        self.url_input.setEnabled(
-            False
-        )
-
-        self.browse_button.setEnabled(
-            False
-        )
-
-        self.status_label.setText(
-            f"Starting {profile.name}..."
-        )
-
-        # ----------------------------------------------------
-        # THREAD
-        # ----------------------------------------------------
-
-        self.download_thread = QThread()
-
-        self.download_worker = DownloadWorker(
-            url=self.current_url,
-
-            profile=profile,
-
-            output_dir=
-                self.output_folder,
-        )
-
-        self.download_worker.moveToThread(
-            self.download_thread
-        )
-
-        self.download_thread.started.connect(
-            self.download_worker.run
-        )
-
-        self.download_worker.progress.connect(
-            self.progress_bar.setValue
-        )
-
-        self.download_worker.status.connect(
-            self.status_label.setText
-        )
-
-        self.download_worker.finished.connect(
-            self.download_complete
-        )
-
-        self.download_worker.error.connect(
-            self.download_error
-        )
-
-        self.download_worker.finished.connect(
-            self.download_thread.quit
-        )
-
-        self.download_worker.error.connect(
-            self.download_thread.quit
-        )
-
-        self.download_thread.finished.connect(
-            self.download_worker.deleteLater
-        )
-
-        self.download_thread.finished.connect(
-            self.download_thread.deleteLater
-        )
-
-        self.download_thread.finished.connect(
-            self.download_thread_finished
-        )
-
-        self.download_thread.start()
-
-    # ========================================================
-    # DOWNLOAD COMPLETE
-    # ========================================================
-
-    def download_complete(self):
-
-        self.progress_bar.setValue(
-            100
-        )
-
-        self.status_label.setText(
-            "Download complete"
-        )
-
-        QMessageBox.information(
-            self,
-            "RetroRip",
-            "Download complete!",
-        )
-
-    # ========================================================
-    # DOWNLOAD ERROR
-    # ========================================================
-
-    def download_error(
-        self,
-        error,
-    ):
-
-        self.status_label.setText(
-            "Download failed"
-        )
-
-        QMessageBox.critical(
-            self,
-            "Download Error",
-            error,
-        )
-
-    # ========================================================
-    # THREAD CLEANUP
-    # ========================================================
-
-    def download_thread_finished(self):
-
-        self.download_thread = None
-        self.download_worker = None
-
-        self.download_button.setEnabled(
-            self.media is not None
-        )
-
-        self.analyze_button.setEnabled(
-            True
-        )
-
-        self.quality_combo.setEnabled(
-            self.media is not None
-        )
-
-        self.url_input.setEnabled(
-            True
-        )
-
-        self.browse_button.setEnabled(
-            True
-        )
-
-    # ========================================================
-    # CLOSE
-    # ========================================================
-
-    def closeEvent(
-        self,
-        event,
-    ):
-
-        if (
-            self.download_thread
-            and
-            self.download_thread.isRunning()
-        ):
-
-            QMessageBox.warning(
-                self,
-                "RetroRip",
-                "A download is still running.",
-            )
-
+    def closeEvent(self, event):
+        if self.info_thread or self.download_thread:
+            QMessageBox.information(self, "RetroRip", "Wait for analysis or recording to finish. Use STOP to cancel a recording.")
             event.ignore()
             return
-
-        if (
-            self.info_thread
-            and
-            self.info_thread.isRunning()
-        ):
-
-            QMessageBox.warning(
-                self,
-                "RetroRip",
-                "Media analysis is still running.",
-            )
-
-            event.ignore()
-            return
-
         event.accept()
 
-    # ========================================================
-    # STYLE
-    # ========================================================
 
-    def apply_style(self):
+STYLE = """
+QMainWindow { background: #111820; }
+QWidget { color: #d5d1c1; font: 12px 'Consolas'; }
+QFrame#deck { background: #202934; border: 2px solid #46505a; border-radius: 14px; }
+QLabel#brand { color: #f29264; font: bold 23px 'Consolas'; }
+QLabel#minor { color: #80919c; font-size: 10px; }
+QLabel#led { color: #83a891; font-weight: bold; }
+QLabel#meta { color: #e7dabe; font-size: 12px; }
+QLabel#status { color: #e6a16b; font-weight: bold; letter-spacing: 1px; }
+QLabel#digits { color: #f4ae75; font: bold 18px 'Consolas'; min-width: 86px; }
+QLabel#path { color: #9daab2; }
+QLineEdit, QComboBox { background: #1a232c; border: 1px solid #55616a; border-radius: 6px;
+                       padding: 11px; color: #f3e6cd; selection-background-color: #b96546; }
+QLineEdit:focus, QComboBox:focus { border-color: #e18459; }
+QComboBox QAbstractItemView { background: #202a32; color: #f3e6cd; selection-background-color: #b96546; }
+QPushButton { background: #34404b; border: 1px solid #62727b; border-bottom: 4px solid #101820;
+              border-radius: 7px; padding: 9px 16px; color: #e5dcc8; font: bold 13px 'Consolas'; }
+QPushButton:hover { background: #485967; border-color: #e2a372; }
+QPushButton:pressed { border-bottom: 1px solid #101820; padding-top: 12px; }
+QPushButton:disabled { background: #232c34; border-color: #303b42; color: #627078; }
+QPushButton#rec { background: #b9503c; border-color: #e17f5b; color: #fff1d7; font-size: 18px; }
+QPushButton#rec:hover { background: #d16347; }
+QPushButton#rec:disabled { background: #513e3c; border-color: #594d4b; color: #83746f; }
+QPushButton#secondary { background: #454e46; }
+QProgressBar { background: #081117; border: 1px solid #485967; border-radius: 5px; height: 13px; }
+QProgressBar::chunk { background: #e27b50; border-radius: 4px; }
+"""
 
-        self.setStyleSheet(
-            """
-            QMainWindow {
-                background-color: #211C18;
-            }
-
-            QWidget {
-                color: #E8D9B5;
-                font-family: "Segoe UI";
-                font-size: 13px;
-            }
-
-            QLabel#title {
-                font-size: 32px;
-                font-weight: bold;
-                color: #F0C987;
-            }
-
-            QLabel#subtitle {
-                color: #B89567;
-                font-size: 12px;
-            }
-
-            QLabel#status {
-                color: #E4A55B;
-                font-weight: bold;
-                padding: 7px;
-            }
-
-            QLineEdit,
-            QComboBox {
-                background-color: #302821;
-                border: 1px solid #665443;
-                padding: 9px;
-                color: #F1E3C4;
-                border-radius: 4px;
-            }
-
-            QLineEdit:focus,
-            QComboBox:focus {
-                border: 1px solid #D1793D;
-            }
-
-            QPushButton {
-                background-color: #594938;
-                border: 1px solid #79634B;
-                padding: 9px 14px;
-                color: #F1E3C4;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-
-            QPushButton:hover {
-                background-color: #705A43;
-            }
-
-            QPushButton:pressed {
-                background-color: #3D3229;
-            }
-
-            QPushButton:disabled {
-                color: #746A60;
-                background-color: #342E28;
-                border-color: #453C34;
-            }
-
-            QPushButton#download {
-                background-color: #BD6339;
-                border-color: #DB8250;
-                font-size: 14px;
-                padding: 12px;
-            }
-
-            QPushButton#download:hover {
-                background-color: #D27342;
-            }
-
-            QProgressBar {
-                border: 1px solid #655240;
-                background-color: #171411;
-                height: 22px;
-                text-align: center;
-                border-radius: 3px;
-                color: #F1E3C4;
-            }
-
-            QProgressBar::chunk {
-                background-color: #C96D3D;
-                border-radius: 2px;
-            }
-
-            QComboBox QAbstractItemView {
-                background-color: #302821;
-                color: #F1E3C4;
-                selection-background-color: #BD6339;
-            }
-            """
-        )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 def main():
-
-    app = QApplication(
-        sys.argv
-    )
-
-    app.setApplicationName(
-        APP_NAME
-    )
-
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
     window = RetroRipWindow()
-
     window.show()
-
-    sys.exit(
-        app.exec()
-    )
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+from threading import Event
 
 import yt_dlp
 
@@ -19,6 +20,7 @@ class MediaInfo:
 
     # Resolution ที่พบจริง
     resolutions: list[int]
+    thumbnail_url: str | None = None
 
 
 @dataclass
@@ -89,6 +91,10 @@ def create_audio_profile() -> DownloadProfile:
 # RETRORIP ENGINE
 # ============================================================
 
+class DownloadCancelled(Exception):
+    """The user stopped the active download."""
+
+
 class RetroRipDownloader:
 
     def __init__(
@@ -96,7 +102,10 @@ class RetroRipDownloader:
         output_dir: str | Path = "downloads",
         progress_callback: Optional[Callable] = None,
         status_callback: Optional[Callable] = None,
+        cancel_event: Event | None = None,
     ):
+
+        self.cancel_event = cancel_event or Event()
 
         self.output_dir = Path(
             output_dir
@@ -281,6 +290,7 @@ class RetroRipDownloader:
             ),
 
             resolutions=resolutions,
+            thumbnail_url=info.get("thumbnail"),
         )
 
     # ========================================================
@@ -292,6 +302,7 @@ class RetroRipDownloader:
         data: dict,
     ):
 
+        self._check_cancel()
         status = data.get(
             "status"
         )
@@ -377,6 +388,15 @@ class RetroRipDownloader:
                 "Download finished. Processing media..."
             )
 
+    def _check_cancel(self):
+        if self.cancel_event.is_set():
+            raise DownloadCancelled("Download stopped by user")
+
+    def _postprocessor_hook(self, data):
+        self._check_cancel()
+        if data.get("status") == "started":
+            self._status("Processing media with FFmpeg...")
+
     # ========================================================
     # DOWNLOAD
     # ========================================================
@@ -387,6 +407,7 @@ class RetroRipDownloader:
         profile: DownloadProfile,
     ):
 
+        self._check_cancel()
         self.output_dir.mkdir(
             parents=True,
             exist_ok=True,
@@ -412,9 +433,10 @@ class RetroRipDownloader:
             "windowsfilenames":
                 True,
 
-            "progress_hooks": [
-                self._progress_hook
-            ],
+            "progress_hooks": [self._progress_hook],
+            "postprocessor_hooks": [self._postprocessor_hook],
+            "quiet": True,
+            "no_warnings": True,
         }
 
         # ====================================================
@@ -463,10 +485,13 @@ class RetroRipDownloader:
             options
         ) as ydl:
 
-            ydl.download(
+            result = ydl.download(
                 [url]
             )
+            if result != 0:
+                raise RuntimeError("yt-dlp reported a download error")
 
+        self._check_cancel()
         self._status(
             "Complete."
         )
