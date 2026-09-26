@@ -1,17 +1,71 @@
-# RetroRip • Cassette Deck
+# RetroRip 0.7 — Pocket Studio
 
-A desktop media downloader powered by yt-dlp. Use it for media you have permission to save, subject to the platform's terms.
+Walkman-style desktop UI พร้อมตลับเทป ฉลากภาพปก และซองเก็บเทป
 
-## Windows quick start
+## ใช้กับโปรเจกต์เดิม
 
-In the extracted `retrorip` folder:
+คัดลอกโฟลเดอร์ `src` ทั้งโฟลเดอร์ไปแทน `src` ของ RetroRip เดิม ต้องมี `deck_scene.py` และ `assets/clack.wav` อยู่ด้วย
+
+เปิด Terminal ในโฟลเดอร์โปรเจกต์ แล้วรัน:
 
 ```powershell
-py -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt
 .venv\Scripts\python src\main.py
 ```
 
-Install [FFmpeg](https://ffmpeg.org/download.html) and make `ffmpeg` available on your PATH for merging video/audio and converting MP3. If your existing repository uses `src/main.py`, copy `src/main.py`, `src/downloader.py`, and the entire `src/assets` directory into its `src` directory.
+หากยังไม่มี virtual environment ให้สร้างก่อน:
 
-Paste a URL and choose **LOAD TAPE**. Select a quality from the resolutions that yt-dlp found, then press **REC**. **STOP** requests cancellation during an active transfer; it may leave a partial file in the output directory and can take time during FFmpeg processing. **EJECT** clears the loaded media after the active job has ended. The cover art is optional; a built-in label appears if the thumbnail is unavailable. Sound needs an available audio output device.
+```powershell
+py -m venv .venv
+```
+
+ต้องมี Python 3.10 ขึ้นไป และ FFmpeg ใน PATH สำหรับรวม video/audio หรือแปลง MP3
+
+## วิธีใช้
+
+1. วาง URL ที่หน้าแรก แล้วกด **MAKE A TAPE**
+2. รออ่านชื่อและภาพปก แล้วเลือก MP4/ความละเอียดที่มีจริง หรือ MP3
+3. กด **RECORD THIS TAPE** — เทปจะเลื่อนเข้าเครื่อง จากนั้นเริ่มดาวน์โหลด
+4. ระหว่างดาวน์โหลด รีลหมุน เทปพันเข้าม้วน และมีสถานะการรับข้อมูล
+5. หลัง backend ทำไฟล์เสร็จ เทปจะดีดออกพร้อมภาพปกและชื่อบนฉลาก
+6. กด **OK · KEEP MY TAPE** — เทปจะลอยเข้าซอง
+7. กด **MAKE ANOTHER TAPE** เพื่อทำรายการถัดไป หรือ **OPEN DOWNLOADS** เพื่อเปิดไฟล์
+
+ปุ่ม **SOUND ON/OFF** ใช้เปิดปิดเสียงกลไก
+
+## ดู animation โดยไม่โหลดคลิป
+
+```powershell
+.venv\Scripts\python src\main.py --demo
+```
+
+กด MAKE A TAPE ได้เลย แล้วกด RECORD THIS TAPE เพื่อชมทุกขั้นตอน โหมดนี้แสดงข้อมูลและ progress จำลอง ไม่มีการดาวน์โหลดไฟล์สื่อ
+
+## พฤติกรรมที่ควรรู้
+
+- Progress แสดงเปอร์เซ็นต์ของ stream ที่กำลังโหลด วิดีโอกับเสียงอาจถูกโหลดแยกกัน การที่ stream หนึ่งถึง 100% ยังไม่ทำให้เทปดีดออก
+- เทปจะดีดออกหลัง `download()` และการประมวลผลที่เกี่ยวข้องจบแล้วเท่านั้น
+- **STOP** ยกเลิกผ่าน flag ที่ backend ตรวจระหว่างดาวน์โหลดและจุดเชื่อมของ postprocessor งาน FFmpeg ที่กำลังรันอาจต้องรอให้ขั้นตอนปัจจุบันจบก่อน และอาจเหลือไฟล์ชั่วคราวหรือไฟล์ที่ทำเสร็จแล้ว
+- หากหา thumbnail ไม่ได้ จะใช้ลายกราฟิกสำรองบนฉลาก ชื่อคลิปที่ยาวจะย่อบนหน้าจอและแสดงเต็มใน tooltip
+- ซองและตัวนับ Tapes kept เป็นภาพแสดงผลของการใช้งานครั้งนี้ ไม่ใช่ฐานข้อมูลประวัติถาวร ไฟล์สื่ออยู่ในโฟลเดอร์ output ตั้งแต่ดาวน์โหลดเสร็จ ปุ่ม KEEP ไม่ได้ย้ายหรือลบไฟล์
+- เสียงต้องมีอุปกรณ์เสียงที่ระบบรองรับ ถ้าไม่มีเสียง UI และการดาวน์โหลดยังทำงานได้
+
+## ตรวจสอบแล้ว
+
+ทดสอบด้วย Python 3.12 / PySide6 6.11.2 บน Qt แบบ offscreen และใช้ backend จำลอง:
+
+- แสดงผลหน้าแรก ขณะอัด เทปดีดออก และเก็บเข้าซอง
+- flow สำเร็จครบทุกขั้นและเริ่มรายการใหม่
+- ยกเลิกก่อนเริ่มดาวน์โหลด และยกเลิกขณะกำลังอัด
+- กรณีดาวน์โหลดล้มเหลวไม่แสดงว่าเก็บเทปสำเร็จ
+- รับข้อมูลหลาย stream และรอขั้นตอน processing
+- worker ใช้ QThread จริง ส่งผลกลับ UI และคืนทรัพยากร
+- ภาพปก ชื่อยาว และหน้าต่างขนาดขั้นต่ำ
+
+ยังไม่ได้ทดสอบดาวน์โหลดจากเว็บไซต์จริงหรือฟังเสียงจากอุปกรณ์เสียง Windows ในสภาพแวดล้อมนี้
+
+รันทดสอบ:
+
+```powershell
+.venv\Scripts\python -m unittest discover -s tests -v
+```

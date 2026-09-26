@@ -226,6 +226,9 @@ class RetroRipDownloader:
         )
 
         options = {
+            "socket_timeout": 12,
+            "retries": 2,
+            "extractor_retries": 2,
 
             "quiet":
                 True,
@@ -420,6 +423,9 @@ class RetroRipDownloader:
         )
 
         options = {
+            "socket_timeout": 12,
+            "retries": 2,
+            "extractor_retries": 2,
 
             "format":
                 profile.format_selector,
