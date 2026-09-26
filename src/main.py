@@ -2,32 +2,41 @@ import sys
 
 from downloader import (
     RetroRipDownloader,
-    DOWNLOAD_PROFILES,
+    create_video_profile,
+    create_audio_profile,
 )
 
 
 APP_NAME = "RetroRip"
-VERSION = "0.3"
+VERSION = "0.4"
 
 
 # ============================================================
-# UTILITIES
+# FORMAT HELPERS
 # ============================================================
 
-def format_duration(seconds):
+def format_duration(
+    seconds,
+):
 
     if seconds is None:
         return "Unknown"
 
-    seconds = int(seconds)
+    seconds = int(
+        seconds
+    )
 
-    hours = seconds // 3600
+    hours = (
+        seconds // 3600
+    )
 
     minutes = (
         seconds % 3600
     ) // 60
 
-    secs = seconds % 60
+    secs = (
+        seconds % 60
+    )
 
     if hours:
 
@@ -43,7 +52,9 @@ def format_duration(seconds):
     )
 
 
-def format_bytes(value):
+def format_bytes(
+    value,
+):
 
     if value is None:
         return "?"
@@ -53,37 +64,55 @@ def format_bytes(value):
         "KB",
         "MB",
         "GB",
+        "TB",
     ]
 
-    size = float(value)
+    size = float(
+        value
+    )
 
     for unit in units:
 
         if size < 1024:
-            return f"{size:.2f} {unit}"
+
+            return (
+                f"{size:.2f} "
+                f"{unit}"
+            )
 
         size /= 1024
 
-    return f"{size:.2f} TB"
+    return (
+        f"{size:.2f} PB"
+    )
 
 
 # ============================================================
 # CALLBACKS
 # ============================================================
 
-def status_callback(message):
+def status_callback(
+    message,
+):
 
     print(
         f"\n[STATUS] {message}"
     )
 
 
-def progress_callback(data):
+def progress_callback(
+    data,
+):
 
-    if (
-        data["status"]
-        == "downloading"
-    ):
+    status = data.get(
+        "status"
+    )
+
+    # ========================================================
+    # DOWNLOADING
+    # ========================================================
+
+    if status == "downloading":
 
         percent = data.get(
             "percent"
@@ -105,15 +134,21 @@ def progress_callback(data):
             "total_bytes"
         )
 
+        # ----------------------------------------------------
+
         if percent is None:
 
-            percent_text = "??.?%"
+            percent_text = (
+                "??.?%"
+            )
 
         else:
 
             percent_text = (
                 f"{percent:5.1f}%"
             )
+
+        # ----------------------------------------------------
 
         message = (
             f"\r[DOWNLOAD] "
@@ -133,21 +168,26 @@ def progress_callback(data):
 
             message += (
                 " / "
-                + format_bytes(total)
+                + format_bytes(
+                    total
+                )
             )
 
         if speed:
 
             message += (
                 " | "
-                + format_bytes(speed)
+                + format_bytes(
+                    speed
+                )
                 + "/s"
             )
 
         if eta is not None:
 
             message += (
-                f" | ETA {eta}s"
+                f" | ETA "
+                f"{eta}s"
             )
 
         print(
@@ -156,10 +196,11 @@ def progress_callback(data):
             flush=True,
         )
 
-    elif (
-        data["status"]
-        == "finished"
-    ):
+    # ========================================================
+    # FINISHED
+    # ========================================================
+
+    elif status == "finished":
 
         print()
 
@@ -177,7 +218,7 @@ def print_header():
     print()
 
     print(
-        "=" * 58
+        "=" * 60
     )
 
     print(
@@ -190,20 +231,74 @@ def print_header():
     )
 
     print(
-        "=" * 58
+        "=" * 60
     )
 
     print()
 
 
-def show_profiles():
+# ============================================================
+# PROFILE MENU
+# ============================================================
+
+def build_profile_menu(
+    resolutions,
+):
+
+    profiles = {}
+
+    option = 1
+
+    # ========================================================
+    # BEST
+    # ========================================================
+
+    profiles[
+        str(option)
+    ] = create_video_profile()
+
+    option += 1
+
+    # ========================================================
+    # RESOLUTIONS FROM MEDIA
+    # ========================================================
+
+    for height in resolutions:
+
+        profiles[
+            str(option)
+        ] = create_video_profile(
+            height
+        )
+
+        option += 1
+
+    # ========================================================
+    # MP3
+    # ========================================================
+
+    profiles[
+        str(option)
+    ] = create_audio_profile()
+
+    return profiles
+
+
+def show_profile_menu(
+    profiles,
+):
 
     print()
-    print("Available formats")
-    print("-" * 40)
+    print(
+        "Available formats"
+    )
+
+    print(
+        "-" * 42
+    )
 
     for key, profile in (
-        DOWNLOAD_PROFILES.items()
+        profiles.items()
     ):
 
         print(
@@ -222,15 +317,23 @@ def main():
 
     print_header()
 
-    downloader = RetroRipDownloader(
-        output_dir="downloads",
+    downloader = (
+        RetroRipDownloader(
 
-        progress_callback=
-            progress_callback,
+            output_dir=
+                "downloads",
 
-        status_callback=
-            status_callback,
+            progress_callback=
+                progress_callback,
+
+            status_callback=
+                status_callback,
+        )
     )
+
+    # ========================================================
+    # URL
+    # ========================================================
 
     url = input(
         "Paste media URL: "
@@ -245,7 +348,7 @@ def main():
         return
 
     # ========================================================
-    # FETCH INFO
+    # FETCH MEDIA INFO
     # ========================================================
 
     try:
@@ -265,10 +368,14 @@ def main():
 
         return
 
+    # ========================================================
+    # MEDIA INFO
+    # ========================================================
+
     print()
 
     print(
-        "=" * 58
+        "=" * 60
     )
 
     print(
@@ -276,47 +383,83 @@ def main():
     )
 
     print(
-        "=" * 58
+        "=" * 60
     )
 
     print(
-        f"Title    : "
+        f"Title       : "
         f"{media.title}"
     )
 
     print(
-        f"Creator  : "
+        f"Creator     : "
         f"{media.creator}"
     )
 
     print(
-        f"Platform : "
+        f"Platform    : "
         f"{media.platform}"
     )
 
     print(
-        f"Duration : "
+        f"Duration    : "
         f"{format_duration(media.duration)}"
     )
 
+    # ========================================================
+    # SHOW DETECTED RESOLUTIONS
+    # ========================================================
+
+    if media.resolutions:
+
+        resolution_text = (
+            ", ".join(
+                f"{height}p"
+                for height
+                in media.resolutions
+            )
+        )
+
+        print(
+            f"Resolutions : "
+            f"{resolution_text}"
+        )
+
+    else:
+
+        print(
+            "Resolutions : "
+            "Unknown"
+        )
+
     print(
-        "=" * 58
+        "=" * 60
     )
 
     # ========================================================
-    # PROFILE SELECT
+    # BUILD DYNAMIC MENU
     # ========================================================
 
-    show_profiles()
+    profiles = (
+        build_profile_menu(
+            media.resolutions
+        )
+    )
+
+    show_profile_menu(
+        profiles
+    )
+
+    # ========================================================
+    # SELECT FORMAT
+    # ========================================================
 
     choice = input(
-        "Select [1-5]: "
+        "Select format: "
     ).strip()
 
-    profile = (
-        DOWNLOAD_PROFILES.get(
-            choice
-        )
+    profile = profiles.get(
+        choice
     )
 
     if profile is None:
@@ -333,6 +476,10 @@ def main():
         f"Selected: "
         f"{profile.name}"
     )
+
+    # ========================================================
+    # CONFIRM
+    # ========================================================
 
     confirm = input(
         "Download? [Y/n]: "
@@ -367,7 +514,7 @@ def main():
         print()
 
         print(
-            "=" * 58
+            "=" * 60
         )
 
         print(
@@ -375,18 +522,22 @@ def main():
         )
 
         print(
-            "=" * 58
+            "=" * 60
         )
 
         print(error)
 
         return
 
+    # ========================================================
+    # COMPLETE
+    # ========================================================
+
     print()
     print()
 
     print(
-        "=" * 58
+        "=" * 60
     )
 
     print(
@@ -394,9 +545,13 @@ def main():
     )
 
     print(
-        "=" * 58
+        "=" * 60
     )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
 

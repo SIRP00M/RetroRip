@@ -17,6 +17,9 @@ class MediaInfo:
     duration: int | None
     webpage_url: str
 
+    # Resolution ที่พบจริง
+    resolutions: list[int]
+
 
 @dataclass
 class DownloadProfile:
@@ -24,58 +27,62 @@ class DownloadProfile:
     format_selector: str
     media_type: str
 
+    height: int | None = None
+
 
 # ============================================================
-# DOWNLOAD PROFILES
+# PROFILE BUILDERS
 # ============================================================
 
-DOWNLOAD_PROFILES = {
-    "1": DownloadProfile(
-        name="MP4 Best",
-        format_selector=(
-            "bv*[ext=mp4]+ba[ext=m4a]"
-            "/b[ext=mp4]"
-            "/bv*+ba/b"
-        ),
-        media_type="video",
-    ),
+def create_video_profile(
+    height: int | None = None,
+) -> DownloadProfile:
 
-    "2": DownloadProfile(
-        name="MP4 1080p",
-        format_selector=(
-            "bv*[height<=1080][ext=mp4]+ba[ext=m4a]"
-            "/b[height<=1080][ext=mp4]"
-            "/bv*[height<=1080]+ba/b[height<=1080]"
-        ),
-        media_type="video",
-    ),
+    # --------------------------------------------------------
+    # BEST QUALITY
+    # --------------------------------------------------------
 
-    "3": DownloadProfile(
-        name="MP4 720p",
-        format_selector=(
-            "bv*[height<=720][ext=mp4]+ba[ext=m4a]"
-            "/b[height<=720][ext=mp4]"
-            "/bv*[height<=720]+ba/b[height<=720]"
-        ),
-        media_type="video",
-    ),
+    if height is None:
 
-    "4": DownloadProfile(
-        name="MP4 480p",
-        format_selector=(
-            "bv*[height<=480][ext=mp4]+ba[ext=m4a]"
-            "/b[height<=480][ext=mp4]"
-            "/bv*[height<=480]+ba/b[height<=480]"
-        ),
-        media_type="video",
-    ),
+        return DownloadProfile(
+            name="MP4 Best",
+            format_selector=(
+                "bv*[ext=mp4]+ba[ext=m4a]"
+                "/b[ext=mp4]"
+                "/bv*+ba/b"
+            ),
+            media_type="video",
+            height=None,
+        )
 
-    "5": DownloadProfile(
+    # --------------------------------------------------------
+    # SPECIFIC RESOLUTION
+    # --------------------------------------------------------
+
+    return DownloadProfile(
+        name=f"MP4 {height}p",
+
+        format_selector=(
+            f"bv*[height<={height}][ext=mp4]"
+            f"+ba[ext=m4a]"
+            f"/b[height<={height}][ext=mp4]"
+            f"/bv*[height<={height}]"
+            f"+ba"
+            f"/b[height<={height}]"
+        ),
+
+        media_type="video",
+        height=height,
+    )
+
+
+def create_audio_profile() -> DownloadProfile:
+
+    return DownloadProfile(
         name="MP3 Best Audio",
         format_selector="bestaudio/best",
         media_type="audio",
-    ),
-}
+    )
 
 
 # ============================================================
@@ -90,50 +97,162 @@ class RetroRipDownloader:
         progress_callback: Optional[Callable] = None,
         status_callback: Optional[Callable] = None,
     ):
-        self.output_dir = Path(output_dir)
 
-        self.progress_callback = progress_callback
-        self.status_callback = status_callback
+        self.output_dir = Path(
+            output_dir
+        )
 
-    # --------------------------------------------------------
+        self.progress_callback = (
+            progress_callback
+        )
+
+        self.status_callback = (
+            status_callback
+        )
+
+    # ========================================================
     # CALLBACK HELPERS
-    # --------------------------------------------------------
+    # ========================================================
 
-    def _status(self, message: str):
+    def _status(
+        self,
+        message: str,
+    ):
 
         if self.status_callback:
-            self.status_callback(message)
 
-    def _progress(self, data: dict):
+            self.status_callback(
+                message
+            )
+
+    def _progress(
+        self,
+        data: dict,
+    ):
 
         if self.progress_callback:
-            self.progress_callback(data)
 
-    # --------------------------------------------------------
-    # FETCH MEDIA INFO
-    # --------------------------------------------------------
+            self.progress_callback(
+                data
+            )
 
-    def get_info(self, url: str) -> MediaInfo:
+    # ========================================================
+    # FORMAT DETECTION
+    # ========================================================
+
+    def _extract_resolutions(
+        self,
+        formats: list,
+    ) -> list[int]:
+
+        resolutions = set()
+
+        for fmt in formats:
+
+            # -----------------------------------------------
+            # Skip audio-only streams
+            # -----------------------------------------------
+
+            vcodec = fmt.get(
+                "vcodec"
+            )
+
+            if (
+                not vcodec
+                or vcodec == "none"
+            ):
+                continue
+
+            # -----------------------------------------------
+            # Get height
+            # -----------------------------------------------
+
+            height = fmt.get(
+                "height"
+            )
+
+            if not height:
+                continue
+
+            try:
+
+                height = int(height)
+
+            except (
+                TypeError,
+                ValueError,
+            ):
+
+                continue
+
+            # -----------------------------------------------
+            # Ignore nonsense values
+            # -----------------------------------------------
+
+            if height < 100:
+                continue
+
+            resolutions.add(
+                height
+            )
+
+        # สูง -> ต่ำ
+
+        return sorted(
+            resolutions,
+            reverse=True,
+        )
+
+    # ========================================================
+    # GET MEDIA INFO
+    # ========================================================
+
+    def get_info(
+        self,
+        url: str,
+    ) -> MediaInfo:
 
         self._status(
             "Reading media information..."
         )
 
         options = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": True,
+
+            "quiet":
+                True,
+
+            "no_warnings":
+                True,
+
+            "skip_download":
+                True,
+
+            "noplaylist":
+                True,
         }
 
-        with yt_dlp.YoutubeDL(options) as ydl:
+        with yt_dlp.YoutubeDL(
+            options
+        ) as ydl:
 
             info = ydl.extract_info(
                 url,
                 download=False,
             )
 
+        formats = info.get(
+            "formats",
+            [],
+        )
+
+        resolutions = (
+            self._extract_resolutions(
+                formats
+            )
+        )
+
         return MediaInfo(
+
             title=info.get(
                 "title",
                 "Unknown",
@@ -160,17 +279,26 @@ class RetroRipDownloader:
                 "webpage_url",
                 url,
             ),
+
+            resolutions=resolutions,
         )
 
-    # --------------------------------------------------------
-    # yt-dlp DOWNLOAD PROGRESS
-    # --------------------------------------------------------
+    # ========================================================
+    # PROGRESS HOOK
+    # ========================================================
 
-    def _progress_hook(self, data: dict):
+    def _progress_hook(
+        self,
+        data: dict,
+    ):
 
         status = data.get(
             "status"
         )
+
+        # ----------------------------------------------------
+        # DOWNLOADING
+        # ----------------------------------------------------
 
         if status == "downloading":
 
@@ -180,8 +308,11 @@ class RetroRipDownloader:
             )
 
             total = (
-                data.get("total_bytes")
-                or data.get(
+                data.get(
+                    "total_bytes"
+                )
+                or
+                data.get(
                     "total_bytes_estimate"
                 )
             )
@@ -197,9 +328,12 @@ class RetroRipDownloader:
                 )
 
             progress_data = {
-                "status": "downloading",
 
-                "percent": percent,
+                "status":
+                    "downloading",
+
+                "percent":
+                    percent,
 
                 "downloaded_bytes":
                     downloaded,
@@ -223,22 +357,29 @@ class RetroRipDownloader:
                 progress_data
             )
 
+        # ----------------------------------------------------
+        # FINISHED
+        # ----------------------------------------------------
+
         elif status == "finished":
 
             self._progress(
                 {
-                    "status": "finished",
-                    "percent": 100,
+                    "status":
+                        "finished",
+
+                    "percent":
+                        100,
                 }
             )
 
             self._status(
-                "Download complete. Processing..."
+                "Download finished. Processing media..."
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DOWNLOAD
-    # --------------------------------------------------------
+    # ========================================================
 
     def download(
         self,
@@ -252,11 +393,13 @@ class RetroRipDownloader:
         )
 
         output_template = str(
+
             self.output_dir
             / "%(title).180B [%(id)s].%(ext)s"
         )
 
         options = {
+
             "format":
                 profile.format_selector,
 
@@ -275,24 +418,31 @@ class RetroRipDownloader:
         }
 
         # ====================================================
-        # VIDEO MODE
+        # VIDEO
         # ====================================================
 
-        if profile.media_type == "video":
+        if (
+            profile.media_type
+            == "video"
+        ):
 
             options[
                 "merge_output_format"
             ] = "mp4"
 
         # ====================================================
-        # AUDIO MODE
+        # AUDIO
         # ====================================================
 
-        elif profile.media_type == "audio":
+        elif (
+            profile.media_type
+            == "audio"
+        ):
 
             options[
                 "postprocessors"
             ] = [
+
                 {
                     "key":
                         "FFmpegExtractAudio",
@@ -306,7 +456,7 @@ class RetroRipDownloader:
             ]
 
         self._status(
-            f"Downloading: {profile.name}"
+            f"Downloading {profile.name}..."
         )
 
         with yt_dlp.YoutubeDL(
