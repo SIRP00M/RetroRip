@@ -4,6 +4,19 @@ from typing import Callable, Optional
 from threading import Event
 
 import yt_dlp
+from yt_dlp.postprocessor.common import PostProcessor
+
+
+class _CaptureFinalPath(PostProcessor):
+    """Runs after conversion, merging, and the final move to the output folder."""
+    def __init__(self, downloader, paths):
+        super().__init__(downloader)
+        self.paths = paths
+
+    def run(self, info):
+        if info.get("filepath"):
+            self.paths.append(Path(info["filepath"]).resolve())
+        return [], info
 
 
 # ============================================================
@@ -487,10 +500,11 @@ class RetroRipDownloader:
             f"Downloading {profile.name}..."
         )
 
+        final_paths = []
         with yt_dlp.YoutubeDL(
             options
         ) as ydl:
-
+            ydl.add_post_processor(_CaptureFinalPath(ydl, final_paths), when="after_move")
             result = ydl.download(
                 [url]
             )
@@ -501,3 +515,6 @@ class RetroRipDownloader:
         self._status(
             "Complete."
         )
+        if not final_paths or not final_paths[-1].is_file():
+            raise RuntimeError("Download finished but its final file could not be located.")
+        return str(final_paths[-1])

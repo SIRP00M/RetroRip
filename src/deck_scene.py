@@ -72,14 +72,20 @@ class DeckScene(QWidget):
     ejected = Signal()
     archived = Signal()
     mechanical = Signal()
+    transport = Signal(str)
     WIDTH, HEIGHT = 1080, 438
-    TRANSITIONS = {"inserting": 1.65, "ejecting": 1.55, "archiving": 1.65, "loading": .65}
+    TRANSITIONS = {"inserting": 2.3, "ejecting": 1.9, "archiving": 1.65, "loading": .65}
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(320)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.mode = "idle"
+        self.dark = False
+        self.tape_color = "#263d3b"
+        self.quality = ""
+        self.hover = self.hover_target = 0.0
+        self.setMouseTracking(True)
         self.title = "YOUR NEXT FAVORITE"
         self.creator = "A little piece of the internet."
         self.platform = "RETRO RIP"
@@ -107,6 +113,26 @@ class DeckScene(QWidget):
         self.start_time = time.perf_counter()
         self.transition = 0.0
         self.update()
+
+    def mouseMoveEvent(self, event):
+        s = min(self.width() / self.WIDTH, self.height() / self.HEIGHT)
+        x = (event.position().x() - (self.width() - self.WIDTH*s)/2)/s
+        self.hover_target = 1.0 if 130 < x < 660 else 0.0
+
+    def leaveEvent(self, event):
+        self.hover_target = 0.0
+
+    def mousePressEvent(self,event):
+        if event.button()!=Qt.LeftButton: return
+        s=min(self.width()/self.WIDTH,self.height()/self.HEIGHT)
+        x=(event.position().x()-(self.width()-self.WIDTH*s)/2)/s-398
+        y=(event.position().y()-(self.height()-self.HEIGHT*s)/2)/s-236
+        a=math.radians(9)
+        dx=x*math.cos(a)-y*math.sin(a)+224
+        dy=x*math.sin(a)+y*math.cos(a)+167
+        for i,action in enumerate(("rec","stop","eject")):
+            if 75+i*85<=dx<=148+i*85 and -16<=dy<=15:
+                self.mechanical.emit(); self.transport.emit(action); return
 
     def load(self, title, creator, platform, duration, picture=b""):
         self.title, self.creator, self.platform, self.duration = title, creator, platform, duration
@@ -137,6 +163,7 @@ class DeckScene(QWidget):
         self.platform, self.duration = "RETRO RIP", "C—90"
         self.cover = QPixmap()
         self.progress = self.visual_progress = 0.0
+        self.quality = ""
         self.outcome = "success"
         self.set_mode("idle")
 
@@ -145,8 +172,9 @@ class DeckScene(QWidget):
         dt = min(.06, now - self.last_time)
         self.last_time = now
         self.phase += dt
-        recording = self.mode in ("recording", "processing", "stopping")
-        speed = 165 if self.mode == "recording" else 78 if recording else 0
+        self.hover += (self.hover_target - self.hover) * min(1,dt*8)
+        recording = self.mode in ("recording", "processing", "stopping", "playing")
+        speed = 165 if self.mode == "recording" else 78 if self.mode in ("processing","playing") else 0
         self.velocity += (speed - self.velocity) * min(1, dt * 6)
         self.angle = (self.angle + self.velocity * dt) % 360
         self.visual_progress += (self.progress - self.visual_progress) * min(1, dt * 5)
@@ -179,11 +207,13 @@ class DeckScene(QWidget):
         complete = (740, 147, 1.00, -7)
         t = ease(self.transition)
         if self.mode == "inserting":
+            t = ease(max(0.0, min(1.0, (self.transition-.22)/.52)))
             return (mix(ready[0], seated[0], t), mix(ready[1], seated[1], t) - 42 * math.sin(t * math.pi),
                     mix(ready[2], seated[2], t), mix(ready[3], seated[3], t))
-        if self.mode in ("recording", "processing", "stopping"):
+        if self.mode in ("recording", "processing", "stopping", "playing", "paused"):
             return seated
         if self.mode == "ejecting":
+            t = ease(max(0.0, min(1.0, (self.transition-.26)/.74)))
             return (mix(seated[0], complete[0], t), mix(seated[1], complete[1], t) - 65 * math.sin(t * math.pi),
                     mix(seated[2], complete[2], t), mix(seated[3], complete[3], t))
         if self.mode == "archiving":
@@ -220,8 +250,8 @@ class DeckScene(QWidget):
 
     def draw_environment(self, p):
         glow = QRadialGradient(QPointF(455, 265), 400)
-        glow.setColorAt(0, color("#e8e5d9", .9))
-        glow.setColorAt(1, color("#e8e5d9", 0))
+        glow.setColorAt(0, color("#26353e" if self.dark else "#e8e5d9", .9))
+        glow.setColorAt(1, color("#26353e" if self.dark else "#e8e5d9", 0))
         p.setPen(Qt.NoPen)
         p.setBrush(glow)
         p.drawEllipse(QRectF(20, -40, 870, 550))
@@ -254,9 +284,11 @@ class DeckScene(QWidget):
         p.save()
         self.device_transform(p)
         # Orange mechanical keys along the upper rim.
-        for i in range(5):
-            rounded(p, 75+i*51, -15, 43, 29, 5, "#ca5b36" if i == 0 else "#536466", "#213b42", 2)
-            p.fillRect(QRectF(79+i*51, -12, 35, 2), color("#efab7f" if i == 0 else "#80908b"))
+        for i,name in enumerate(("REC","STOP","EJECT")):
+            pressed = 5 if i == 0 and self.mode in ("recording","processing","playing") else self.hover*2
+            rounded(p, 75+i*85, -15+pressed, 73, 29-pressed, 5, "#e38554" if i == 0 and self.hover>.3 else "#ca5b36" if i == 0 else "#536466", "#213b42", 2)
+            p.fillRect(QRectF(79+i*85, -12+pressed, 65, 2), color("#efab7f" if i == 0 else "#80908b"))
+            label(p,93+i*85,0+pressed,name,8,"#ece2c7",True,True)
         rounded(p, 6, 7, 448, 333, 24, "#162d35", "#1d353f", 2)
         rounded(p, 0, 0, 448, 332, 22,
                 gradient(0,332,[(0,"#447483"),(.06,"#2c586c"),(.55,"#204255"),(1,"#193849")]), "#6e8c91", 1.5)
@@ -296,20 +328,22 @@ class DeckScene(QWidget):
         p.restore()
 
     def draw_door(self, p):
-        seated = self.mode in ("recording", "processing", "stopping")
-        closure = 1 if seated else 0
+        seated = self.mode in ("recording", "processing", "stopping", "playing", "paused")
+        closure = 1 if seated or self.mode in ("idle","ready","analyzing","loading","archived") else 0
         if self.mode == "inserting":
-            closure = ease(max(0, (self.transition-.65)/.35))
+            closure = 1-ease(min(1,self.transition/.22)) if self.transition<.22 else ease(max(0,(self.transition-.74)/.26))
         elif self.mode == "ejecting":
-            closure = 1-ease(min(1, self.transition/.3))
-        if closure <= 0:
-            return
+            closure = 1-ease(min(1, self.transition/.26))
         p.save()
         self.device_transform(p)
-        p.setOpacity(closure)
+        p.translate(0,283)
+        p.shear(.14*(1-closure),0)
+        p.scale(1,.16+.84*closure)
+        p.translate(0,-283)
+        p.setOpacity(.65+.35*closure)
         rounded(p, 25, 70, 398, 213, 14, color("#72989d", .12), "#6a888f", 2)
         shine = QLinearGradient(30,80,420,270)
-        shine.setColorAt(0,color("#ffffff",.12))
+        shine.setColorAt(0,color("#ffffff",.12+self.hover*.13))
         shine.setColorAt(.4,color("#ffffff",.02))
         shine.setColorAt(.41,color("#ffffff",.16))
         shine.setColorAt(.49,color("#ffffff",.02))
@@ -324,18 +358,19 @@ class DeckScene(QWidget):
         p.rotate(angle)
         p.scale(scale,scale)
         p.translate(-184,-101)
+        lift = 1.0+min(1.2,max(0,(246-y)/100)) if self.mode in ("inserting","ejecting","archiving") else 1.0 if self.mode in ("recording","processing","playing","paused") else 1.8
         for i in range(9, 0, -1):
-            rounded(p, -i*.7, 8+i*.5, 368+i*1.4, 202+i*.5, 15, color("#172933", .012))
+            rounded(p, -i*.7*lift, 8+i*.5*lift, 368+i*1.4*lift, 202+i*.5*lift, 15, color("#071a21", .02/lift))
         rounded(p, 0, 5, 368, 202, 14, "#1b302f", "#10262d", 1.5)
         rounded(p, 0, 0, 368, 202, 13,
-                gradient(0,202,[(0,"#465853"),(.1,"#263d3b"),(1,"#213834")]), "#7e9282", 1.3)
+                gradient(0,202,[(0,QColor(self.tape_color).lighter(155).name()),(.1,self.tape_color),(1,QColor(self.tape_color).darker(120).name())]), "#7e9282", 1.3)
         rounded(p, 12, 13, 344, 155, 8, "#eee2bf", "#182c2d", 1.5)
         rounded(p, 17, 17, 334, 14, 2, "#d76e3e")
         label(p, 24, 27, "R E T R O R I P      /      PERSONAL MIXTAPE", 7, "#fff0c8", True, True)
         artwork(p, QRectF(23, 37, 93, 54), self.cover)
         label(p, 127, 52, self.title, 12, "#273834", True, width=211)
         label(p, 127, 70, self.creator, 9, "#666c59", width=211)
-        label(p, 127, 84, f"{self.platform.upper()}  /  {self.duration}", 8, "#907756", mono=True, width=211)
+        label(p, 127, 84, f"{self.platform.upper()} / {self.duration} / {self.quality}", 8, "#907756", mono=True, width=211)
         rounded(p, 24, 100, 320, 62, 27, "#12282b", "#7c8067", 1.6)
         p.setPen(QPen(color("#6b4230"), 3))
         p.drawLine(QPointF(102,140), QPointF(267,140))
@@ -422,7 +457,7 @@ class DeckScene(QWidget):
             label(p, 735, 343, "Made to keep. Made yours.", 12, "#a39d8e")
         elif self.mode in ("recording","processing","stopping","inserting"):
             title = "ON AIR." if self.mode == "recording" else "MAKING YOUR TAPE."
-            label(p, 731, 139, title, 27, "#23404b", True)
+            label(p, 731, 139, title, 27, "#d8e3dd" if self.dark else "#23404b", True)
             label(p, 733, 165, "GOOD THINGS TAKE A LITTLE SPIN.", 9, "#858879", mono=True)
             for i in range(19):
                 height = (8 + 43*(.5+.5*math.sin(self.phase*4+i*.7)))*(.3 if self.mode == "inserting" else 1)
@@ -431,6 +466,6 @@ class DeckScene(QWidget):
         elif self.mode == "complete":
             label(p,600,47,"YOUR TAPE IS READY.",10,"#b56540",True,True)
         elif self.mode == "archived":
-            label(p,720,136,"A KEEPER.",32,"#2f524e",True)
+            label(p,720,136,"A KEEPER.",32,"#c6e2d8" if self.dark else "#2f524e",True)
             label(p,722,163,"Your file is in the output folder.",12,"#939181")
             label(p,722,185,"Ready for another one?",12,"#939181")

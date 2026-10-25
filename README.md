@@ -1,77 +1,143 @@
-# RetroRip 0.7.1 — Pocket Studio
+# RetroRip — Pocket Studio 1.0
 
-Walkman-style desktop UI พร้อมตลับเทป ฉลากภาพปก และซองเก็บเทป
+**A retro cassette-inspired desktop media downloader, player, and personal collection manager.**
 
-## แก้ไขใน 0.7.1
+[English](README.md) | [ภาษาไทย](README_TH.md)
 
-แก้ซองเทปเก่าค้างทับเทปใหม่และข้อความหลังจากกด **MAKE ANOTHER TAPE** โดยแสดงซองเฉพาะขั้นตอนรับ/เก็บเทป ตัวนับเทปที่เก็บยังคงเดิม เพิ่มการทดสอบเทียบภาพหน้าแรกหลังทำเทปต่อเนื่องสองรายการ
+RetroRip turns the process of downloading and organizing media into a virtual tape-recording experience. Its five-page desktop interface combines animated cassette mechanics with a persistent media library, download queue, playback, and customizable tape labels.
 
-หากใช้ 0.7 อยู่แล้ว สามารถแทนเฉพาะ `src/deck_scene.py` เพื่อแก้บัคนี้ได้ทันที
+> **Version 1.0 source distribution.** This repository includes Windows helper scripts and a PyInstaller build script; no prebuilt `.exe` or installer is bundled. FFmpeg must be installed separately. Platform and third-party website compatibility are not guaranteed.
 
-## ใช้กับโปรเจกต์เดิม
+## Features
 
-คัดลอกโฟลเดอร์ `src` ทั้งโฟลเดอร์ไปแทน `src` ของ RetroRip เดิม ต้องมี `deck_scene.py` และ `assets/clack.wav` อยู่ด้วย
+- **Home:** Start recording, access your recent tapes, or import an existing media file.
+- **Studio:** Paste a URL, inspect media metadata, choose a tape name/color and quality, record, then keep the tape.
+- **Collection:** Search by title or creator, play saved media, open files/folders, rename tape labels, and relink moved files.
+- **Queue:** Add URLs on separate lines and process them sequentially, automatically recording and keeping completed tapes.
+- **Settings:** Switch between light/dark themes; set download quality, mechanical sound, and output directory.
+- **Persistent storage:** Keep collection metadata, cover images, queues, labels, and preferences in a local SQLite database.
+- **Built-in playback:** Play supported media through Qt Multimedia, or open a file in an external application.
+- **Offline demo:** Explore the UI, cassette animation, and short sample playback without downloading online media.
 
-เปิด Terminal ในโฟลเดอร์โปรเจกต์ แล้วรัน:
+## Requirements
 
-```powershell
-.venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python src\main.py
+- Python **3.10 or newer**
+- Dependencies from [`requirements.txt`](requirements.txt): PySide6 and yt-dlp
+- **FFmpeg on your PATH** for merging separate video/audio streams and converting to MP3
+- A supported operating system and multimedia codecs for in-app playback
+
+Some websites may require an additional JavaScript runtime or access verification depending on yt-dlp and the website. Version 1.0 does **not** provide a UI for supplying accounts or browser cookies. Only download content you are entitled to access and follow the source service's terms.
+
+## Get started on Windows
+
+1. Install Python 3.10+ and FFmpeg; confirm `ffmpeg` works in your terminal.
+2. Download/extract the project (or clone this repository).
+3. Double-click **`INSTALL_WINDOWS.bat`** to install the dependencies.
+4. Double-click **`RUN_WINDOWS.bat`** to launch RetroRip.
+
+You can also run the demo from a terminal in the project directory:
+
+```bat
+RUN_WINDOWS.bat --demo
 ```
 
-หากยังไม่มี virtual environment ให้สร้างก่อน:
+## Run from a terminal (Windows / macOS / Linux)
 
-```powershell
-py -m venv .venv
+```bash
+python -m venv .venv
 ```
 
-ต้องมี Python 3.10 ขึ้นไป และ FFmpeg ใน PATH สำหรับรวม video/audio หรือแปลง MP3
+Activate the virtual environment:
 
-## วิธีใช้
+```bash
+# macOS / Linux
+source .venv/bin/activate
 
-1. วาง URL ที่หน้าแรก แล้วกด **MAKE A TAPE**
-2. รออ่านชื่อและภาพปก แล้วเลือก MP4/ความละเอียดที่มีจริง หรือ MP3
-3. กด **RECORD THIS TAPE** — เทปจะเลื่อนเข้าเครื่อง จากนั้นเริ่มดาวน์โหลด
-4. ระหว่างดาวน์โหลด รีลหมุน เทปพันเข้าม้วน และมีสถานะการรับข้อมูล
-5. หลัง backend ทำไฟล์เสร็จ เทปจะดีดออกพร้อมภาพปกและชื่อบนฉลาก
-6. กด **OK · KEEP MY TAPE** — เทปจะลอยเข้าซอง
-7. กด **MAKE ANOTHER TAPE** เพื่อทำรายการถัดไป หรือ **OPEN DOWNLOADS** เพื่อเปิดไฟล์
-
-ปุ่ม **SOUND ON/OFF** ใช้เปิดปิดเสียงกลไก
-
-## ดู animation โดยไม่โหลดคลิป
-
-```powershell
-.venv\Scripts\python src\main.py --demo
+# Windows PowerShell
+# .venv\Scripts\Activate.ps1
 ```
 
-กด MAKE A TAPE ได้เลย แล้วกด RECORD THIS TAPE เพื่อชมทุกขั้นตอน โหมดนี้แสดงข้อมูลและ progress จำลอง ไม่มีการดาวน์โหลดไฟล์สื่อ
+Then install and launch:
 
-## พฤติกรรมที่ควรรู้
-
-- Progress แสดงเปอร์เซ็นต์ของ stream ที่กำลังโหลด วิดีโอกับเสียงอาจถูกโหลดแยกกัน การที่ stream หนึ่งถึง 100% ยังไม่ทำให้เทปดีดออก
-- เทปจะดีดออกหลัง `download()` และการประมวลผลที่เกี่ยวข้องจบแล้วเท่านั้น
-- **STOP** ยกเลิกผ่าน flag ที่ backend ตรวจระหว่างดาวน์โหลดและจุดเชื่อมของ postprocessor งาน FFmpeg ที่กำลังรันอาจต้องรอให้ขั้นตอนปัจจุบันจบก่อน และอาจเหลือไฟล์ชั่วคราวหรือไฟล์ที่ทำเสร็จแล้ว
-- หากหา thumbnail ไม่ได้ จะใช้ลายกราฟิกสำรองบนฉลาก ชื่อคลิปที่ยาวจะย่อบนหน้าจอและแสดงเต็มใน tooltip
-- ซองและตัวนับ Tapes kept เป็นภาพแสดงผลของการใช้งานครั้งนี้ ไม่ใช่ฐานข้อมูลประวัติถาวร ไฟล์สื่ออยู่ในโฟลเดอร์ output ตั้งแต่ดาวน์โหลดเสร็จ ปุ่ม KEEP ไม่ได้ย้ายหรือลบไฟล์
-- เสียงต้องมีอุปกรณ์เสียงที่ระบบรองรับ ถ้าไม่มีเสียง UI และการดาวน์โหลดยังทำงานได้
-
-## ตรวจสอบแล้ว
-
-ทดสอบด้วย Python 3.12 / PySide6 6.11.2 บน Qt แบบ offscreen และใช้ backend จำลอง:
-
-- แสดงผลหน้าแรก ขณะอัด เทปดีดออก และเก็บเข้าซอง
-- flow สำเร็จครบทุกขั้นและเริ่มรายการใหม่
-- ยกเลิกก่อนเริ่มดาวน์โหลด และยกเลิกขณะกำลังอัด
-- กรณีดาวน์โหลดล้มเหลวไม่แสดงว่าเก็บเทปสำเร็จ
-- รับข้อมูลหลาย stream และรอขั้นตอน processing
-- worker ใช้ QThread จริง ส่งผลกลับ UI และคืนทรัพยากร
-- ภาพปก ชื่อยาว และหน้าต่างขนาดขั้นต่ำ
-
-ยังไม่ได้ทดสอบดาวน์โหลดจากเว็บไซต์จริงหรือฟังเสียงจากอุปกรณ์เสียง Windows ในสภาพแวดล้อมนี้
-
-รันทดสอบ:
-
-```powershell
-.venv\Scripts\python -m unittest discover -s tests -v
+```bash
+python -m pip install -r requirements.txt
+python src/main.py
 ```
+
+If in-app playback is unsupported by your system's media codecs, use **••• → Open file externally** instead.
+
+## How to use
+
+1. Open **Studio** and paste a media URL.
+2. Wait for the metadata and available formats to load.
+3. Choose a tape label, cassette color, and MP4/MP3 quality, then press **RECORD**.
+4. Wait for the download and any required post-processing to finish.
+5. Press **KEEP** to place the tape in your Collection. Completed downloads are also persisted before KEEP so they are not lost if the app closes.
+6. Open **Collection** to search, play, relabel, locate, or relink your media.
+
+For multiple URLs, use **Queue**: paste one URL per line, select **ADD TO STACK**, then **START QUEUE**. Items run sequentially.
+
+### Behavior and limitations
+
+- You can navigate between pages while recording; the bottom status bar provides a shortcut back to Studio.
+- **PAUSE AFTER CURRENT** finishes the current queue item before pausing. **CANCEL** cancels that item only.
+- Cassette deck controls include **REC**, **STOP**, and **EJECT**. EJECT returns an idle tape or requests a stop during recording.
+- Relabeling changes the Collection display name, **not** the filename on disk.
+- Collection actions do not move or delete the original media file.
+- Queue items left unfinished when the app closes return to a waiting state on the next launch. Press **START QUEUE** to resume; the queue does not automatically restart.
+- Canceling during FFmpeg processing may take until the current operation finishes. Temporary or completed output files may remain.
+- Final video/audio merging can continue after an individual download stream reports 100%.
+
+## Application data
+
+RetroRip stores its collection, cover art, tape labels, queue, and preferences in **SQLite** under the operating system's application-data directory. Open the location from **Settings → OPEN DATA FOLDER**.
+
+The default media output folder is **`Downloads/RetroRip`**, configurable in Settings.
+
+```bash
+python src/main.py --data-dir /path/to/custom/catalog
+python src/main.py --demo
+```
+
+`--demo` simulates recording and plays a short sample (approximately three seconds). It does not download online media and uses isolated temporary catalog data unless you explicitly supply `--data-dir`.
+
+## Build a Windows executable
+
+After installing the dependencies, run:
+
+```bat
+BUILD_WINDOWS_EXE.bat
+```
+
+The expected output is **`dist/RetroRip/RetroRip.exe`**. Distribute the **entire `dist/RetroRip` folder**, not just the executable. FFmpeg must still be available on the destination PC's PATH.
+
+The supplied ZIP contains source code and a build script, **not** a built executable. A real Windows build and runtime acceptance test have not been confirmed for this package.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The version 1.0 package documents Qt offscreen tests covering recording/KEEP/another tape, queue workers and page navigation, cancellation/retry, persisted themes and labels, page layouts in both themes, WAV playback controls, and local HTTP download plus MP3 conversion with yt-dlp/FFmpeg. These are package-reported test scenarios, **not a claim of new tests performed for this README update**.
+
+Actual downloads from third-party services, account-restricted content, real Windows audio hardware, and installation on other machines have not been fully verified here.
+
+## Project structure
+
+| Path | Purpose |
+| --- | --- |
+| `src/main.py` | Application shell, navigation, Queue, Collection, Settings |
+| `src/studio.py` | Studio flow and worker lifecycle |
+| `src/deck_scene.py` | Cassette/deck visuals and animations |
+| `src/downloader.py` | yt-dlp download backend and final media-path reporting |
+| `src/storage.py` | SQLite persistence |
+| `src/player.py` | Qt Multimedia player |
+| `src/themes.py` | Light/dark theme styling |
+| `src/assets/` | Icon and cassette click sound |
+| `tests/` | Automated checks |
+| `tools/render_preview.py` | Preview rendering utility |
+
+## Licensing and third-party software
+
+PySide6, yt-dlp, and FFmpeg have their own licenses and distribution obligations. FFmpeg binaries are not included in this source package. **The repository's current `LICENSE` file is empty**, so no project-wide open-source license grant should be assumed until the maintainer publishes one.

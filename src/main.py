@@ -1,742 +1,660 @@
-"""RetroRip 0.7 — a portable recorder for the web.
-Run with --demo to preview the entire UI sequence without a network download.
-"""
+"""RetroRip 1.0: persistent five-page desktop app. Run with --demo for an offline tour."""
+import argparse
 import math
-import os
-import sys
-import time
+import tempfile
+import wave
 from pathlib import Path
-from threading import Event
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
-from PySide6.QtCore import QThread, QTimer, Qt, QUrl, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QFont
+from PySide6.QtCore import Qt, Signal, QTimer, QUrl, QStandardPaths, QPointF, QRectF, QVariantAnimation, QEasingCurve, QByteArray, QBuffer, QIODevice
+from PySide6.QtGui import QPainter, QColor, QPixmap, QDesktopServices, QFont, QPalette, QLinearGradient, QIcon
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
+    QApplication, QMainWindow, QWidget, QFrame, QHBoxLayout, QVBoxLayout, QGridLayout,
+    QStackedWidget, QScrollArea, QLabel, QPushButton, QLineEdit, QComboBox, QTextEdit,
+    QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QDialog,
+    QDialogButtonBox, QFormLayout, QMenu, QMessageBox,
 )
-try:
-    from PySide6.QtMultimedia import QSoundEffect
-except ImportError:
-    QSoundEffect = None
+from studio import RetroRipWindow, text_label, button, duration_text
+from downloader import create_video_profile
+from deck_scene import DeckScene, rounded, label, artwork, ease
+from storage import Store
+from themes import stylesheet
+from player import PlayerDialog
 
-from deck_scene import DeckScene
-from downloader import DownloadCancelled, MediaInfo, RetroRipDownloader, create_audio_profile, create_video_profile
-
-ROOT = Path(__file__).resolve().parent.parent
-ASSETS = Path(__file__).resolve().parent / "assets"
-VERSION = "0.7.1"
+COLORS = {"Forest": "#263d3b", "Midnight": "#263e59", "Terracotta": "#864d3c", "Plum": "#654763", "Graphite": "#35414b"}
+PROFILES = ["MP4 Best", "MP4 1080p", "MP4 720p", "MP3 Best Audio"]
 
 
-def duration_text(seconds):
-    if seconds is None:
-        return "LIVE / UNKNOWN"
-    minutes, seconds = divmod(max(0, int(seconds)), 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours:02}:{minutes:02}:{seconds:02}" if hours else f"{minutes:02}:{seconds:02}"
+class Studio(RetroRipWindow):
+    state_changed = Signal(str)
+    recorded = Signal(object, bytes)
+    kept = Signal()
+    problem = Signal(str)
 
-
-def size_text(value):
-    if value is None:
-        return "—"
-    number = float(value)
-    for unit in ("B", "KB", "MB", "GB"):
-        if number < 1024 or unit == "GB":
-            return f"{number:.1f} {unit}"
-        number /= 1024
-
-
-class ElidedLabel(QLabel):
-    """Long media titles and paths never stretch the window."""
-    def __init__(self, text="", parent=None):
-        super().__init__(parent)
-        self.full_text = text
-        self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.setText(text)
-
-    def setText(self, text):
-        self.full_text = str(text)
-        self.setToolTip(self.full_text)
-        super().setText(self.fontMetrics().elidedText(self.full_text, Qt.ElideRight, max(20, self.width())))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        QLabel.setText(self, self.fontMetrics().elidedText(self.full_text, Qt.ElideRight, max(20, self.width())))
-
-
-def text_label(text, name="", parent=None, elide=False):
-    widget = ElidedLabel(text, parent) if elide else QLabel(text, parent)
-    widget.setTextFormat(Qt.PlainText)
-    if name:
-        widget.setObjectName(name)
-    return widget
-
-
-def button(text, callback, name=""):
-    b = QPushButton(text)
-    b.setObjectName(name)
-    b.setCursor(Qt.PointingHandCursor)
-    b.clicked.connect(callback)
-    return b
-
-
-class InfoJob(QThread):
-    result = Signal(object, bytes)
-    failed = Signal(str)
-
-    def __init__(self, url, parent=None):
-        super().__init__(parent)
-        self.url = url
-
-    def run(self):
-        try:
-            media = RetroRipDownloader().get_info(self.url)
-            picture = b""
-            if media.thumbnail_url and media.thumbnail_url.startswith(("https://", "http://")):
-                try:
-                    request = Request(media.thumbnail_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urlopen(request, timeout=6) as response:
-                        if response.headers.get_content_type().startswith("image/"):
-                            picture = response.read(2_000_001)
-                            if len(picture) > 2_000_000:
-                                picture = b""
-                except Exception:
-                    pass
-            self.result.emit(media, picture)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-
-
-class DownloadJob(QThread):
-    progress = Signal(object)
-    status = Signal(str)
-    success = Signal()
-    cancelled = Signal()
-    failed = Signal(str)
-
-    def __init__(self, url, profile, folder, parent=None):
-        super().__init__(parent)
-        self.url, self.profile, self.folder = url, profile, folder
-        self.cancel_event = Event()
-        self.last_progress_emit = 0.0
-
-    def forward_progress(self, data):
-        now = time.monotonic()
-        if data.get("status") != "downloading" or now - self.last_progress_emit >= .05:
-            self.last_progress_emit = now
-            self.progress.emit(data)
-
-    def run(self):
-        try:
-            engine = RetroRipDownloader(
-                output_dir=self.folder, progress_callback=self.forward_progress,
-                status_callback=self.status.emit, cancel_event=self.cancel_event,
-            )
-            engine.download(self.url, self.profile)
-            if self.cancel_event.is_set():
-                self.cancelled.emit()
-            else:
-                self.success.emit()
-        except Exception as exc:
-            if isinstance(exc, DownloadCancelled) or self.cancel_event.is_set():
-                self.cancelled.emit()
-            else:
-                self.failed.emit(str(exc))
-
-
-class RetroRipWindow(QMainWindow):
     def __init__(self, demo=False):
-        super().__init__()
-        self.demo = demo
-        self.state = "idle"
-        self.media = None
-        self.loaded_url = ""
-        self.profiles = []
-        self.info_job = self.download_job = None
-        self.output_folder = str(ROOT / "downloads")
-        self.pending_outcome = "success"
-        self.failure_message = ""
-        self.stream_number = 0
-        self.stream_filename = None
-        self.transfer_percent = None
-        self.sound_enabled = True
-        self.sound = None
-        self.demo_progress = 0.0
-        self.demo_timer = QTimer(self)
-        self.demo_timer.setInterval(100)
-        self.demo_timer.timeout.connect(self.demo_tick)
-        self.setWindowTitle(f"RetroRip • Pocket Studio {VERSION}" + (" • DEMO" if demo else ""))
-        self.resize(1120, 830)
-        self.setMinimumSize(920, 740)
-        self.make_ui()
-        self.setStyleSheet(STYLE)
-        if QSoundEffect:
-            self.sound = QSoundEffect(self)
-            self.sound.setSource(QUrl.fromLocalFile(str(ASSETS / "clack.wav")))
-            self.sound.setVolume(.3)
-        else:
-            self.sound_btn.setEnabled(False)
-            self.sound_btn.setText("SOUND UNAVAILABLE")
-        self.update_state("idle")
+        self.cover_data = b""
+        self.last_error = ""
+        self.automatic = False
+        self.current_tape_id = None
+        self.default_profile = "MP4 Best"
+        super().__init__(demo)
+        self.setMinimumSize(0,0)
+        self.scene.setMinimumHeight(255)
+        self.pages.setFixedHeight(166)
+        self.count_label.hide()
+        self.sound_btn.hide()
+        self.footer_status.hide()
+        self.step_label.hide()
+        root=self.centralWidget().layout()
+        root.setContentsMargins(24,24,24,12)
+        header=root.itemAt(0).layout()
+        for i in range(header.count()):
+            if header.itemAt(i).widget(): header.itemAt(i).widget().hide()
+        root.itemAt(1).widget().hide()
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Name your tape")
+        self.color_combo = QComboBox(); self.color_combo.addItems(COLORS)
+        row = QHBoxLayout(); row.addWidget(self.name_edit,1); row.addWidget(self.color_combo)
+        self.ready_page.layout().insertLayout(1,row)
+        self.name_edit.textChanged.connect(self.apply_label)
+        self.color_combo.currentTextChanged.connect(self.apply_label)
+        self.quality.currentTextChanged.connect(self.apply_label)
+        self.scene.transport.connect(self.transport)
 
-    def make_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(34, 22, 34, 15)
-        root.setSpacing(10)
-        nav = QHBoxLayout()
-        nav.addWidget(text_label("▰  RETRORIP", "brand"))
-        nav.addWidget(text_label("POCKET STUDIO  /  01", "navSmall"))
-        nav.addStretch()
-        self.sound_btn = button("SOUND ON", self.toggle_sound, "quiet")
-        nav.addWidget(self.sound_btn)
-        self.count_label = text_label("000 TAPES KEPT", "navSmall")
-        nav.addWidget(self.count_label)
-        root.addLayout(nav)
-        rule = QFrame()
-        rule.setObjectName("rule")
-        rule.setFixedHeight(1)
-        root.addWidget(rule)
+    def transport(self,action):
+        if action=="rec": self.insert_tape()
+        elif action=="stop": self.stop_download()
+        elif action=="eject":
+            if self.state=="ready": self.new_tape()
+            else: self.stop_download()
 
-        headline_row = QHBoxLayout()
-        headings = QVBoxLayout()
-        headings.setSpacing(0)
-        self.headline = text_label("Make it a mixtape.", "headline")
-        self.subheading = text_label("Your favorites, with a little analog soul.", "subheading")
-        headings.addWidget(self.headline)
-        headings.addWidget(self.subheading)
-        headline_row.addLayout(headings)
-        headline_row.addStretch()
-        self.step_label = text_label("01  LINK     /     02  RECORD     /     03  KEEP", "steps")
-        headline_row.addWidget(self.step_label, 0, Qt.AlignBottom)
-        root.addLayout(headline_row)
-        self.scene = DeckScene()
-        self.scene.inserted.connect(self.begin_download)
-        self.scene.ejected.connect(self.on_ejected)
-        self.scene.archived.connect(self.on_archived)
-        self.scene.mechanical.connect(self.clack)
-        root.addWidget(self.scene, 1)
-
-        self.panel = QFrame()
-        self.panel.setObjectName("panel")
-        panel_layout = QVBoxLayout(self.panel)
-        panel_layout.setContentsMargins(25, 17, 25, 17)
-        self.pages = QStackedWidget()
-        self.pages.setFixedHeight(119)
-        panel_layout.addWidget(self.pages)
-        root.addWidget(self.panel)
-        self.build_input_page()
-        self.build_ready_page()
-        self.build_record_page()
-        self.build_complete_page()
-        self.build_archived_page()
-        self.build_stopped_page()
-
-        footer = QHBoxLayout()
-        self.folder_label = text_label("SAVING TO  /  " + self.output_folder, "footer", elide=True)
-        self.folder_label.setMinimumWidth(0)
-        footer.addWidget(self.folder_label, 1)
-        self.change_btn = button("CHANGE", self.choose_folder, "quiet")
-        footer.addWidget(self.change_btn)
-        footer.addWidget(button("OPEN FOLDER ↗", self.open_folder, "quiet"))
-        root.addLayout(footer)
-        self.footer_status = text_label("YOUTUBE  ·  TIKTOK  ·  FACEBOOK       /       REWIND THE WEB. KEEP THE MEDIA.", "footerTiny")
-        root.addWidget(self.footer_status)
-
-    def new_page(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0,0,0,0)
-        layout.setSpacing(9)
-        self.pages.addWidget(page)
-        return page, layout
-
-    def build_input_page(self):
-        self.input_page, layout = self.new_page()
-        layout.addWidget(text_label("01  /  START WITH A LINK", "eyebrow"))
-        row = QHBoxLayout()
-        self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Paste a video or audio link here…")
-        self.url_input.setClearButtonEnabled(True)
-        self.url_input.returnPressed.connect(self.analyze)
-        row.addWidget(self.url_input,1)
-        self.load_btn = button("MAKE A TAPE   →",self.analyze,"primary")
-        self.load_btn.setMinimumWidth(190)
-        row.addWidget(self.load_btn)
-        layout.addLayout(row)
-        self.input_hint = text_label("We'll make the label. You choose the quality.", "hint")
-        layout.addWidget(self.input_hint)
-
-    def build_ready_page(self):
-        self.ready_page, layout = self.new_page()
-        self.media_title = text_label("YOUR TAPE", "panelTitle", elide=True)
-        layout.addWidget(self.media_title)
-        row = QHBoxLayout()
-        self.quality = QComboBox()
-        self.quality.setMinimumWidth(240)
-        row.addWidget(self.quality,1)
-        row.addWidget(button("CHANGE LINK",self.new_tape,"secondary"))
-        self.rec_btn = button("●  RECORD THIS TAPE",self.insert_tape,"primary")
-        row.addWidget(self.rec_btn)
-        layout.addLayout(row)
-        self.media_meta = text_label("", "hint", elide=True)
-        layout.addWidget(self.media_meta)
-
-    def build_record_page(self):
-        self.record_page, layout = self.new_page()
-        upper = QHBoxLayout()
-        self.record_label = text_label("02  /  RECORDING", "eyebrow")
-        self.percent_label = text_label("—", "readout")
-        upper.addWidget(self.record_label)
-        upper.addStretch()
-        upper.addWidget(self.percent_label)
-        layout.addLayout(upper)
-        row = QHBoxLayout()
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0,1000)
-        self.progress_bar.setTextVisible(False)
-        row.addWidget(self.progress_bar,1)
-        self.stop_btn = button("■  STOP",self.stop_download,"secondary")
-        self.stop_btn.setMinimumWidth(130)
-        row.addWidget(self.stop_btn)
-        layout.addLayout(row)
-        self.transfer_label = text_label("Sliding the tape into place…", "hint")
-        layout.addWidget(self.transfer_label)
-
-    def build_complete_page(self):
-        self.complete_page, layout = self.new_page()
-        layout.addWidget(text_label("03  /  A LITTLE SOMETHING TO KEEP", "eyebrow"))
-        row = QHBoxLayout()
-        self.complete_title = text_label("Your recording is ready.", "panelTitle", elide=True)
-        row.addWidget(self.complete_title,1)
-        row.addWidget(button("OK  ·  KEEP MY TAPE   ↘",self.keep_tape,"primary"))
-        layout.addLayout(row)
-        layout.addWidget(text_label("Your file is saved. Tuck the tape into its sleeve.", "hint"))
-
-    def build_archived_page(self):
-        self.archived_page, layout = self.new_page()
-        layout.addWidget(text_label("FILE SAVED  /  TAPE KEPT", "eyebrow"))
-        row = QHBoxLayout()
-        row.addWidget(text_label("One for the collection.", "panelTitle"),1)
-        row.addWidget(button("OPEN DOWNLOADS ↗",self.open_folder,"secondary"))
-        row.addWidget(button("MAKE ANOTHER TAPE   +",self.new_tape,"primary"))
-        layout.addLayout(row)
-        layout.addWidget(text_label("The sleeve is your keepsake. The media is in your output folder.", "hint"))
-
-    def build_stopped_page(self):
-        self.stopped_page, layout = self.new_page()
-        self.stopped_title = text_label("RECORDING STOPPED", "eyebrow")
-        layout.addWidget(self.stopped_title)
-        row = QHBoxLayout()
-        self.stopped_hint = text_label("You can try again or load another link.", "hint")
-        self.stopped_hint.setWordWrap(True)
-        row.addWidget(self.stopped_hint,1)
-        row.addWidget(button("NEW LINK",self.new_tape,"secondary"))
-        self.retry_btn = button("TRY AGAIN   ↻",self.retry,"primary")
-        row.addWidget(self.retry_btn)
-        layout.addLayout(row)
-
-    def update_state(self, state):
-        self.state = state
-        pages = {
-            "idle": self.input_page, "analyzing": self.input_page, "ready": self.ready_page,
-            "inserting": self.record_page, "recording": self.record_page, "processing": self.record_page,
-            "stopping": self.record_page, "ejecting": self.record_page, "complete": self.complete_page,
-            "archiving": self.complete_page, "archived": self.archived_page, "stopped": self.stopped_page,
-        }
-        self.pages.setCurrentWidget(pages[state])
-        text = {
-            "idle": ("Make it a mixtape.", "Your favorites, with a little analog soul."),
-            "analyzing": ("Let's make a label.", "Finding the title, artwork and available qualities."),
-            "ready": ("This one's yours.", "Choose a format, then let the reels do their thing."),
-            "inserting": ("A little analog magic.", "Loading your cassette into the recorder."),
-            "recording": ("Good things take a spin.", "Recording your favorite corner of the internet."),
-            "processing": ("The finishing touches.", "Preparing the final media file. Almost there."),
-            "stopping": ("Bringing the reels to rest.", "Waiting for the current transfer or processing step to stop."),
-            "ejecting": ("Fresh off the tape.", "Opening the door and handing your cassette back."),
-            "complete": ("Made to keep.", "A cover. A name. A little piece of the internet."),
-            "archiving": ("Right where it belongs.", "Tucking your tape into its own sleeve."),
-            "archived": ("A keeper, indeed.", "Your recording is saved. There's always room for another."),
-            "stopped": ("Take it from the top.", "Your tape is out. Ready whenever you are."),
-        }
-        title, subtitle = text[state]
-        self.headline.setText(title)
-        self.subheading.setText(subtitle)
-        active = state not in ("idle","ready","complete","archived","stopped")
-        self.change_btn.setEnabled(not active)
-        self.load_btn.setEnabled(state == "idle" and self.info_job is None)
-        self.url_input.setEnabled(state == "idle")
-        self.rec_btn.setEnabled(state == "ready" and self.info_job is None and self.download_job is None)
-        self.retry_btn.setEnabled(state == "stopped" and self.download_job is None)
-        self.stop_btn.setEnabled(state in ("inserting","recording","processing"))
-        self.complete_page.setEnabled(state == "complete")
-        self.quality.setEnabled(state == "ready")
-        if self.demo:
-            self.footer_status.setText("DEMO MODE  /  ANIMATION PREVIEW ONLY — NO MEDIA IS DOWNLOADED")
-
-    @Slot()
-    def toggle_sound(self):
-        self.sound_enabled = not self.sound_enabled
-        self.sound_btn.setText("SOUND ON" if self.sound_enabled else "SOUND OFF")
-        self.clack()
-
-    @Slot()
-    def clack(self):
-        if self.sound and self.sound_enabled and self.sound.isLoaded():
-            self.sound.stop()
-            self.sound.play()
-
-    @Slot()
-    def analyze(self):
-        if self.state != "idle" or self.info_job or self.download_job:
-            return
-        url = self.url_input.text().strip()
-        if not url and not self.demo:
-            self.input_hint.setText("Paste a link to make your first tape.")
-            self.url_input.setFocus()
-            return
-        if not self.demo and not url.lower().startswith(("http://","https://")):
-            self.input_hint.setText("Use a complete link beginning with https:// or http://.")
-            return
-        self.clack()
-        self.loaded_url = url
-        self.update_state("analyzing")
-        self.scene.set_mode("analyzing")
-        self.input_hint.setText("Reading the label and looking for cover art…")
-        if self.demo:
-            QTimer.singleShot(650,self.load_demo_media)
-            return
-        self.info_job = InfoJob(url,self)
-        self.info_job.result.connect(self.media_ready)
-        self.info_job.failed.connect(self.info_failed)
-        self.info_job.finished.connect(self.info_finished)
-        self.info_job.start()
-
-    @Slot(object,bytes)
-    def media_ready(self,media,picture):
-        self.media = media
-        self.profiles = [create_video_profile()]
-        self.profiles.extend(create_video_profile(h) for h in media.resolutions)
-        self.profiles.append(create_audio_profile())
-        self.quality.clear()
-        self.quality.addItems([p.name for p in self.profiles])
-        self.media_title.setText(media.title)
-        self.media_title.setToolTip(media.title)
-        self.media_meta.setText(f"{media.creator}   /   {media.platform}   /   {duration_text(media.duration)}")
-        self.scene.load(media.title,media.creator,media.platform,duration_text(media.duration),picture)
-        self.update_state("ready")
-
-    @Slot(str)
-    def info_failed(self,message):
-        self.update_state("idle")
-        self.scene.reset()
-        self.input_hint.setText("Could not read this link. Check it and try again.")
-        self.input_hint.setToolTip(message)
-        self.show_error("Could not load media",message)
-
-    @Slot()
-    def info_finished(self):
-        job = self.info_job
-        self.info_job = None
-        if job:
-            job.deleteLater()
-        self.update_state(self.state)
-
-    @Slot()
-    def insert_tape(self):
-        if self.state != "ready" or not self.media or self.info_job or self.download_job:
-            return
-        self.stream_number = 0
-        self.stream_filename = None
-        self.transfer_percent = None
-        self.progress_bar.setRange(0,0)
-        self.percent_label.setText("LOADING")
-        self.record_label.setText("02  /  LOADING YOUR TAPE")
-        self.transfer_label.setText("Sliding the tape into place…")
-        self.pending_outcome = "success"
-        self.update_state("inserting")
-        self.scene.insert()
-
-    @Slot()
-    def begin_download(self):
-        if self.state != "inserting":
-            return
-        self.update_state("recording")
-        self.record_label.setText("02  /  RECORDING")
-        self.percent_label.setText("CONNECTING")
-        self.transfer_label.setText("Connecting to the media stream…")
-        self.scene.set_mode("recording")
-        if self.demo:
-            self.demo_progress = 0
-            self.demo_timer.start()
-            return
-        profile = self.profiles[self.quality.currentIndex()]
-        self.download_job = DownloadJob(self.loaded_url,profile,self.output_folder,self)
-        self.download_job.progress.connect(self.on_progress)
-        self.download_job.status.connect(self.on_status)
-        self.download_job.success.connect(self.on_success)
-        self.download_job.cancelled.connect(self.on_cancelled)
-        self.download_job.failed.connect(self.on_failed)
-        self.download_job.finished.connect(self.download_finished)
-        self.download_job.start()
-
-    @Slot(object)
-    def on_progress(self,data):
-        if self.state not in ("recording","processing"):
-            return
-        if data.get("status") == "downloading":
-            filename = data.get("filename") or "stream"
-            if filename != self.stream_filename:
-                self.stream_number += 1
-                self.stream_filename = filename
-            self.update_state("recording")
-            if self.scene.mode != "recording":
-                self.scene.set_mode("recording")
-            percent = data.get("percent")
-            self.transfer_percent = percent
-            self.record_label.setText(f"02  /  RECORDING STREAM {self.stream_number:02}")
-            if percent is None:
-                self.progress_bar.setRange(0,0)
-                self.percent_label.setText("RECORDING")
+    def update_state(self,state):
+        super().update_state(state)
+        if hasattr(self,"name_edit"):
+            editable=state=="ready" and not self.automatic
+            self.name_edit.setEnabled(editable); self.color_combo.setEnabled(editable)
+            if self.automatic:
+                self.quality.setEnabled(False)
+                for page in (self.ready_page,self.archived_page,self.stopped_page):
+                    for control in page.findChildren(QPushButton): control.setEnabled(False)
             else:
-                percent = max(0,min(100,float(percent)))
-                self.progress_bar.setRange(0,1000)
-                self.progress_bar.setValue(round(percent*10))
-                self.percent_label.setText(f"{percent:.1f}%  OF STREAM")
-                self.scene.progress = percent
-            speed = size_text(data.get("speed")) + "/s" if data.get("speed") else "—"
-            eta = duration_text(data.get("eta")) if data.get("eta") is not None else "—"
-            self.transfer_label.setText(f"{size_text(data.get('downloaded_bytes'))}   /   {speed}   /   ETA {eta}    ·    Video and audio may transfer separately.")
-        elif data.get("status") == "finished":
-            # A stream finishing is not equivalent to a completed recording.
-            self.progress_bar.setRange(0,0)
-            self.percent_label.setText("PREPARING")
-            self.transfer_label.setText("Stream received. Preparing the next step…")
+                for page in (self.archived_page,self.stopped_page):
+                    for control in page.findChildren(QPushButton): control.setEnabled(True)
+                for control in self.ready_page.findChildren(QPushButton): control.setEnabled(state=="ready" and not self.info_job)
+        self.state_changed.emit(state)
 
-    @Slot(str)
-    def on_status(self,message):
-        if self.state not in ("recording","processing"):
-            return
-        if "ffmpeg" in message.lower():
-            self.update_state("processing")
-            self.scene.set_mode("processing")
-            self.progress_bar.setRange(0,0)
-            self.percent_label.setText("FINALIZING")
-            self.record_label.setText("02  /  FINISHING THE RECORDING")
-            self.transfer_label.setText("Merging or converting the media file…")
+    def media_ready(self,media,picture):
+        if self.demo and not picture: picture=getattr(self,"demo_cover",b"")
+        self.cover_data = picture
+        self.current_tape_id = None
+        self.last_error = ""
+        super().media_ready(media,picture)
+        self.name_edit.setText(media.title)
+        self.select_profile(self.default_profile)
+        self.apply_label()
 
-    @Slot()
-    def stop_download(self):
-        if self.state not in ("inserting","recording","processing"):
-            return
-        self.clack()
-        if self.state == "inserting":
-            self.pending_outcome = "cancelled"
-            self.scene.set_mode("stopped")
-            self.update_state("stopped")
-            self.stopped_title.setText("RECORDING CANCELLED")
-            self.stopped_hint.setText("The recording had not started. No download was made.")
-            return
-        self.update_state("stopping")
-        self.scene.set_mode("stopping")
-        self.percent_label.setText("STOPPING")
-        self.transfer_label.setText("Stop requested. Waiting for the active transfer or FFmpeg step…")
-        if self.demo:
-            self.demo_timer.stop()
-            QTimer.singleShot(250,self.on_cancelled)
-        elif self.download_job:
-            self.download_job.cancel_event.set()
+    def select_profile(self,name):
+        index = self.quality.findText(name)
+        if index < 0 and name.startswith("MP4 ") and name.endswith("p"):
+            height = int(name.split()[1][:-1])
+            profile = create_video_profile(height)
+            self.profiles.append(profile)
+            self.quality.addItem(profile.name)
+            index = len(self.profiles)-1
+        self.quality.setCurrentIndex(max(0,index))
 
-    @Slot()
-    def on_success(self):
+    def apply_label(self,*args):
+        if self.media:
+            self.scene.title = self.name_edit.text().strip() or self.media.title
+            self.scene.tape_color = COLORS[self.color_combo.currentText()]
+            self.scene.quality = self.quality.currentText()
+            self.scene.update()
+
+    def on_success(self,final_path=None):
         if self.state not in ("recording","processing","stopping"):
             return
-        self.pending_outcome = "success"
-        self.update_state("ejecting")
-        self.progress_bar.setRange(0,1000)
-        self.progress_bar.setValue(1000)
-        self.percent_label.setText("SAVED")
-        self.record_label.setText("03  /  EJECTING YOUR TAPE")
-        self.transfer_label.setText("Recording complete. Your cassette is on its way out…")
-        self.scene.progress = 100
-        self.scene.finish(True)
+        info = dict(title=self.scene.title, original_title=self.media.title, creator=self.media.creator,
+                    platform=self.media.platform, duration=self.media.duration,
+                    duration_text=duration_text(self.media.duration), quality=self.quality.currentText(),
+                    color=self.scene.tape_color, path=final_path or "", url=self.loaded_url, kept=False, demo=self.demo)
+        self.recorded.emit(info,self.cover_data)
+        super().on_success(final_path)
 
-    @Slot()
-    def on_cancelled(self):
-        self.pending_outcome = "cancelled"
-        self.update_state("ejecting")
-        self.percent_label.setText("STOPPED")
-        self.record_label.setText("EJECTING")
-        self.transfer_label.setText("Recording stopped. Returning the cassette…")
-        self.scene.finish(False)
-
-    @Slot(str)
-    def on_failed(self,message):
-        self.pending_outcome = "failed"
-        self.failure_message = message
-        self.update_state("ejecting")
-        self.percent_label.setText("FAILED")
-        self.record_label.setText("EJECTING")
-        self.transfer_label.setText("The recording could not finish. Returning the cassette…")
-        self.scene.finish(False)
-
-    @Slot()
-    def download_finished(self):
-        job = self.download_job
-        self.download_job = None
-        if job:
-            job.deleteLater()
-        self.update_state(self.state)
-
-    @Slot()
-    def on_ejected(self):
-        if self.pending_outcome == "success":
-            self.update_state("complete")
-            self.complete_title.setText(self.media.title if self.media else "Your recording is ready.")
-        else:
-            self.update_state("stopped")
-            self.stopped_title.setText("RECORDING FAILED" if self.pending_outcome == "failed" else "RECORDING STOPPED")
-            self.stopped_hint.setText("A partial file may remain. Press Try again to record this tape again.")
-            if self.pending_outcome == "failed":
-                self.show_error("Recording failed",self.failure_message)
-
-    @Slot()
-    def keep_tape(self):
-        if self.state != "complete" or self.download_job:
-            return
-        self.update_state("archiving")
-        self.scene.archive()
-
-    @Slot()
     def on_archived(self):
-        self.count_label.setText(f"{self.scene.saved_count:03} TAPES KEPT")
-        self.update_state("archived")
+        super().on_archived()
+        self.kept.emit()
 
-    @Slot()
-    def retry(self):
-        if self.state == "stopped" and self.media and self.download_job is None:
-            self.scene.set_mode("ready")
-            self.update_state("ready")
-
-    @Slot()
     def new_tape(self):
-        if self.info_job or self.download_job or self.state not in ("ready","stopped","archived"):
-            return
-        self.clack()
-        self.media = None
-        self.profiles = []
-        self.loaded_url = ""
-        self.url_input.clear()
-        self.input_hint.setText("We'll make the label. You choose the quality.")
-        self.scene.reset()
-        self.update_state("idle")
-        self.url_input.setFocus()
+        if self.automatic: return
+        super().new_tape()
+        if self.state == "idle":
+            self.last_error = ""
+            self.current_tape_id = None
+            self.cover_data = b""
 
-    def choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(self,"Choose download folder",self.output_folder)
-        if folder:
-            self.output_folder = folder
-            self.folder_label.setText("SAVING TO  /  " + folder)
-            self.folder_label.setToolTip(folder)
+    def retry(self):
+        if self.automatic: return
+        self.last_error = ""
+        super().retry()
 
-    def open_folder(self):
-        try:
-            os.makedirs(self.output_folder,exist_ok=True)
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_folder)):
-                self.show_error("Open folder",f"Open this folder manually:\n{self.output_folder}")
-        except OSError as exc:
-            self.show_error("Open folder",str(exc))
+    def on_failed(self,message):
+        self.last_error = message
+        super().on_failed(message)
+
+    def info_failed(self,message):
+        self.last_error = message
+        super().info_failed(message)
 
     def show_error(self,title,message):
-        box = QMessageBox(self)
-        box.setWindowTitle("RetroRip • " + title)
-        box.setIcon(QMessageBox.Warning)
-        box.setText(title)
-        box.setInformativeText("Check the link, connection, or FFmpeg installation. Details are below.")
-        box.setDetailedText(message)
-        box.setAttribute(Qt.WA_DeleteOnClose)
-        box.open()
+        self.problem.emit(title + ": " + message)
+        if not self.automatic:
+            super().show_error(title,message)
+
+
+class TapeArt(QWidget):
+    clicked = Signal()
+    def __init__(self,tape,cover,parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(158)
+        self.setCursor(Qt.PointingHandCursor)
+        self.renderer = DeckScene(self)
+        self.renderer.hide(); self.renderer.timer.stop()
+        self.renderer.load(tape["title"],tape.get("creator",""),tape.get("platform",""),tape.get("duration_text",""),cover)
+        self.renderer.quality = tape.get("quality","")
+        self.renderer.tape_color = tape.get("color","#263d3b")
+        self.renderer.mode = "ready"
+        self.hover = False
+
+    def enterEvent(self,event):
+        self.hover = True; self.update()
+    def leaveEvent(self,event):
+        self.hover = False; self.update()
+    def mousePressEvent(self,event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+    def paintEvent(self,event):
+        p=QPainter(self); p.setRenderHints(QPainter.Antialiasing|QPainter.SmoothPixmapTransform)
+        rounded(p,4,self.height()-11,self.width()-8,8,3,"#b29976")
+        rounded(p,5,self.height()-12,self.width()-10,3,1,"#d2bd98")
+        s=min((self.width()-14)/380,(self.height()-20)/220)
+        p.translate(self.width()/2,self.height()/2-10 if self.hover else self.height()/2-6)
+        p.scale(s,s)
+        self.renderer.draw_tape(p,0,0,1,-2 if self.hover else 0)
+        p.end()
+
+
+class ArchiveFlight(QWidget):
+    def __init__(self,parent,start,end,title,cover):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setGeometry(parent.rect())
+        self.start,self.end,self.title=start,end,title
+        self.cover=QPixmap(); self.cover.loadFromData(cover)
+        self.t=0.0
+        self.animation=QVariantAnimation(self)
+        self.animation.setStartValue(0.0); self.animation.setEndValue(1.0)
+        self.animation.setDuration(1000); self.animation.setEasingCurve(QEasingCurve.InOutCubic)
+        self.animation.valueChanged.connect(self.advance)
+        self.animation.finished.connect(self.deleteLater)
+        self.show(); self.raise_(); self.animation.start()
+    def advance(self,value):
+        self.t=value; self.update()
+    def paintEvent(self,event):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        t=self.t; x=(1-t)*self.start.x()+t*self.end.x(); y=(1-t)*self.start.y()+t*self.end.y()-110*math.sin(math.pi*t)
+        p.translate(x,y); p.rotate(7*(1-t)); p.scale(1-.8*t,1-.8*t)
+        p.setOpacity(1-max(0,(t-.9)*10))
+        rounded(p,-110,-58,220,126,7,"#ddcba6","#b69e78")
+        artwork(p,QRectF(-92,-40,65,52),self.cover)
+        label(p,-18,-17,self.title,12,"#30483f",True,width=109)
+        label(p,-90,47,"RETRO RIP / COLLECTION",9,"#846b4d",True,True)
+        p.end()
+
+
+class QueueStack(QWidget):
+    """A physical stack that settles when the next cassette is picked up."""
+    def __init__(self,parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(172)
+        self.items=[]; self.dark=False; self.shift=0
+        self.motion=QVariantAnimation(self); self.motion.setStartValue(24.0); self.motion.setEndValue(0.0)
+        self.motion.setDuration(650); self.motion.setEasingCurve(QEasingCurve.OutCubic)
+        self.motion.valueChanged.connect(self.move_stack)
+    def move_stack(self,value):
+        self.shift=value; self.update()
+    def set_items(self,items):
+        pending=[x for x in items if x["status"]=="pending"]
+        if [x["id"] for x in pending]!=[x["id"] for x in self.items]: self.motion.start()
+        self.items=pending; self.update()
+    def paintEvent(self,event):
+        p=QPainter(self); p.setRenderHint(QPainter.Antialiasing)
+        p.translate(30,16+self.shift)
+        for i in range(min(4,max(1,len(self.items)))-1,-1,-1):
+            p.save(); p.translate(i*18,i*22); p.rotate(-3+i*2)
+            rounded(p,3,7,285,66,8,"#0b1b23")
+            rounded(p,0,0,285,66,8,list(COLORS.values())[i],"#6b8584")
+            rounded(p,13,10,257,43,4,"#ecdfbe")
+            p.fillRect(QRectF(13,10,7,43),QColor("#d17b4b"))
+            text=self.items[i].get("title",self.items[i]["url"]) if i<len(self.items) else "YOUR NEXT MIXTAPE"
+            label(p,29,28,text,11,"#29423e",True,width=228)
+            label(p,29,45,f"{i+1:02} / WAITING TO RECORD" if self.items else "PASTE A LINK TO START",8,"#8d765a",mono=True)
+            p.restore()
+        p.resetTransform()
+        label(p,410,70,f"{len(self.items):02} TAPES IN THE STACK",19,"#e0e7df" if self.dark else "#29434d",True)
+        label(p,410,97,"One goes in. One comes out. Every one is kept.",12,"#a3b4b1" if self.dark else "#828f85")
+        p.end()
+
+
+class AppWindow(QMainWindow):
+    def __init__(self,data_dir=None,demo=False):
+        super().__init__()
+        self.demo=demo
+        self._temporary=tempfile.TemporaryDirectory(prefix="retrorip-demo-") if demo and not data_dir else None
+        location=data_dir or (self._temporary.name if self._temporary else QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+        self.store=Store(location)
+        self.queue_running=False
+        self.active_queue=None
+        self.queue_terminal=None
+        self.queue_after=0
+        self.last_state=""
+        self.players=[]
+        self.dark=self.store.setting("theme","light")=="dark"
+        self.setWindowTitle("RetroRip • Pocket Studio 1.0"+(" • DEMO" if demo else ""))
+        self.resize(1340,900); self.setMinimumSize(1100,780)
+        self.build_shell()
+        self.studio=Studio(demo)
+        self.studio.output_folder=self.store.setting("output",str(Path.home()/"Downloads"/"RetroRip"))
+        self.studio.folder_label.setText("SAVING TO / "+self.studio.output_folder)
+        self.studio.default_profile=self.store.setting("quality","MP4 Best")
+        self.studio.sound_enabled=self.store.setting("sound",True)
+        self.studio.state_changed.connect(self.studio_changed)
+        self.studio.recorded.connect(self.save_recording)
+        self.studio.kept.connect(self.archive_recording)
+        self.studio.problem.connect(self.notify)
+        self.studio.change_btn.hide()
+        self.build_home()
+        self.stack.addWidget(self.studio)
+        self.build_collection()
+        self.build_queue()
+        self.build_settings()
+        self.apply_theme(self.dark,save=False)
+        self.refresh_catalog()
+        self.refresh_queue()
+        self.navigate(0)
+        self.pump=QTimer(self); self.pump.setInterval(250); self.pump.timeout.connect(self.queue_tick); self.pump.start()
+        if demo:
+            self.seed_demo()
+            self.studio.demo_cover=self.store.cover(self.store.tapes()[-1]["id"])
+
+    def build_shell(self):
+        root=QWidget(); root.setObjectName("shell"); self.setCentralWidget(root)
+        row=QHBoxLayout(root); row.setContentsMargins(0,0,0,0); row.setSpacing(0)
+        sidebar=QFrame(); sidebar.setObjectName("sidebar"); sidebar.setFixedWidth(190)
+        nav=QVBoxLayout(sidebar); nav.setContentsMargins(18,27,18,20); nav.setSpacing(9)
+        nav.addWidget(text_label("▰ RETRORIP","brand"))
+        nav.addWidget(text_label("POCKET STUDIO / 1.0","navSmall")); nav.addSpacing(33)
+        self.nav=[]
+        for i,name in enumerate(("⌂   Home","●   Studio","▤   Collection","≡   Queue","⚙   Settings")):
+            b=button(name,lambda checked=False,index=i:self.navigate(index),"nav")
+            b.setCheckable(True); nav.addWidget(b); self.nav.append(b)
+        nav.addStretch()
+        self.catalog_count=text_label("0 TAPES","stat"); nav.addWidget(self.catalog_count)
+        nav.addWidget(text_label("Your own little archive.","hint"))
+        nav.addSpacing(18)
+        self.theme_toggle=button("☾ DARK THEME",lambda:self.apply_theme(not self.dark),"secondary")
+        nav.addWidget(self.theme_toggle)
+        row.addWidget(sidebar)
+        body=QVBoxLayout(); body.setContentsMargins(14,8,14,12)
+        self.stack=QStackedWidget(); body.addWidget(self.stack,1)
+        bar=QFrame(); bar.setObjectName("statusbar")
+        layout=QHBoxLayout(bar)
+        self.global_status=text_label("Ready to make a tape.","hint",elide=True); layout.addWidget(self.global_status,1)
+        self.global_progress=text_label("","readout"); layout.addWidget(self.global_progress)
+        layout.addWidget(button("BACK TO STUDIO →",lambda:self.navigate(1),"quiet"))
+        body.addWidget(bar); row.addLayout(body,1)
+
+    def page(self,title,subtitle):
+        page=QWidget(); page.setObjectName("page")
+        layout=QVBoxLayout(page); layout.setContentsMargins(24,24,24,16); layout.setSpacing(15)
+        layout.addWidget(text_label(title,"pageTitle"))
+        layout.addWidget(text_label(subtitle,"hint"))
+        self.stack.addWidget(page)
+        return page,layout
+
+    def build_home(self):
+        self.home,layout=self.page("A little analog soul.","Welcome to your personal recording room. Link it. Spin it. Keep it.")
+        feature=QFrame(); feature.setObjectName("card"); r=QHBoxLayout(feature)
+        words=QVBoxLayout(); words.addWidget(text_label("The internet.\nOn your shelf.","pageTitle"))
+        words.addWidget(text_label("Record a favorite, give it a name,\nand make a little collection of your own.","hint"))
+        words.addWidget(button("● MAKE A NEW TAPE",self.go_studio,"primary"))
+        words.addWidget(button("+ IMPORT EXISTING FILES",self.import_files,"secondary")); words.addStretch()
+        r.addLayout(words,1)
+        self.home_scene=DeckScene(); self.home_scene.setMinimumSize(390,230); self.home_scene.setMaximumHeight(320)
+        self.home_scene.transport.connect(lambda action:self.go_studio())
+        r.addWidget(self.home_scene,2); layout.addWidget(feature)
+        row=QHBoxLayout(); self.home_summary=text_label("","panelTitle"); row.addWidget(self.home_summary); row.addStretch()
+        row.addWidget(button("VIEW COLLECTION →",lambda:self.navigate(2),"quiet")); layout.addLayout(row)
+        self.recent=QWidget(); self.recent_layout=QHBoxLayout(self.recent); self.recent_layout.setContentsMargins(0,0,0,0)
+        layout.addWidget(self.recent); layout.addStretch()
+
+    def build_collection(self):
+        self.collection,layout=self.page("Your tape shelf.","A cover, a name, a memory. Click a cassette to play it.")
+        row=QHBoxLayout(); self.search=QLineEdit(); self.search.setPlaceholderText("Search titles or creators…")
+        self.search.textChanged.connect(self.refresh_catalog); row.addWidget(self.search,1)
+        row.addWidget(button("+ IMPORT FILES",self.import_files,"primary")); layout.addLayout(row)
+        self.collection_empty=text_label("Make your first tape in Studio, or import media you already have.","hint")
+        layout.addWidget(self.collection_empty)
+        scroll=QScrollArea(); scroll.setWidgetResizable(True)
+        content=QWidget(); self.shelf=QGridLayout(content); self.shelf.setAlignment(Qt.AlignTop); self.shelf.setSpacing(16)
+        scroll.setWidget(content); layout.addWidget(scroll,1)
+
+    def build_queue(self):
+        self.queue_page,layout=self.page("Next on the deck.","Stack up a few links. We'll record and shelve them one at a time.")
+        self.queue_art=QueueStack(); layout.addWidget(self.queue_art)
+        self.queue_input=QTextEdit(); self.queue_input.setPlaceholderText("Paste one URL per line…")
+        self.queue_input.setMaximumHeight(110); layout.addWidget(self.queue_input)
+        row=QHBoxLayout(); self.queue_profile=QComboBox(); self.queue_profile.addItems(PROFILES)
+        row.addWidget(self.queue_profile); row.addWidget(button("+ ADD TO STACK",self.add_queue,"primary")); row.addStretch()
+        self.queue_start=button("▶ START QUEUE",self.start_queue,"primary"); row.addWidget(self.queue_start)
+        row.addWidget(button("Ⅱ PAUSE AFTER CURRENT",self.pause_queue,"secondary")); layout.addLayout(row)
+        self.queue_summary=text_label("","hint"); layout.addWidget(self.queue_summary)
+        self.queue_table=QTableWidget(0,4); self.queue_table.setHorizontalHeaderLabels(["TAPE / LINK","FORMAT","STATUS","ACTION"])
+        self.queue_table.horizontalHeader().setSectionResizeMode(0,QHeaderView.Stretch)
+        for col in (1,2,3): self.queue_table.horizontalHeader().setSectionResizeMode(col,QHeaderView.ResizeToContents)
+        self.queue_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.queue_table.verticalHeader().hide(); layout.addWidget(self.queue_table,1)
+
+    def build_settings(self):
+        self.settings_page,layout=self.page("Make yourself at home.","Your preferences are saved automatically on this computer.")
+        panel=QFrame(); panel.setObjectName("card"); form=QFormLayout(panel); form.setContentsMargins(24,24,24,24); form.setSpacing(22)
+        self.theme_combo=QComboBox(); self.theme_combo.addItems(["Light — Cream studio","Dark — Midnight studio"])
+        self.theme_combo.setCurrentIndex(1 if self.dark else 0)
+        self.theme_combo.currentIndexChanged.connect(lambda i:self.apply_theme(i==1)); form.addRow("Appearance",self.theme_combo)
+        self.default_quality=QComboBox(); self.default_quality.addItems(PROFILES)
+        self.default_quality.setCurrentText(self.studio.default_profile)
+        self.default_quality.currentTextChanged.connect(self.save_quality); form.addRow("Default recording format",self.default_quality)
+        self.sound_check=QCheckBox("Mechanical button and cassette sounds")
+        self.sound_check.setChecked(self.studio.sound_enabled); self.sound_check.toggled.connect(self.save_sound)
+        form.addRow("Sound effects",self.sound_check)
+        row=QHBoxLayout(); self.output_value=text_label(self.studio.output_folder,"hint",elide=True)
+        row.addWidget(self.output_value,1); row.addWidget(button("CHOOSE…",self.choose_output,"secondary")); form.addRow("Download folder",row)
+        form.addRow("Collection data",button("OPEN DATA FOLDER ↗",lambda:self.open_path(self.store.directory),"secondary"))
+        layout.addWidget(panel)
+        layout.addWidget(text_label("RetroRip Pocket Studio 1.0\nPython · Qt · yt-dlp\nFFmpeg is required for video/audio merging and MP3 conversion.","hint"))
+        layout.addStretch()
+
+    def navigate(self,index):
+        if index>=self.stack.count(): return
+        self.stack.setCurrentIndex(index)
+        for i,b in enumerate(self.nav): b.setChecked(i==index)
+
+    def go_studio(self):
+        if self.studio.state in ("archived","stopped") and not self.active_queue:
+            self.studio.new_tape()
+        self.navigate(1)
+
+    def apply_theme(self,dark,save=True):
+        self.dark=bool(dark)
+        style=stylesheet(self.dark)
+        self.setStyleSheet(style); self.studio.setStyleSheet(style)
+        self.studio.scene.dark=self.dark; self.home_scene.dark=self.dark
+        self.queue_art.dark=self.dark; self.queue_art.update()
+        palette=QApplication.instance().palette()
+        for role,shade in ((QPalette.Window,"#131c24" if dark else "#f3f0e7"),(QPalette.WindowText,"#dce5de" if dark else "#273f48"),
+                           (QPalette.Base,"#1c2933" if dark else "#fffcf5"),(QPalette.Text,"#dce5de" if dark else "#273f48")):
+            palette.setColor(role,QColor(shade))
+        QApplication.instance().setPalette(palette)
+        self.theme_toggle.setText("☀ LIGHT THEME" if dark else "☾ DARK THEME")
+        if hasattr(self,"theme_combo"):
+            self.theme_combo.blockSignals(True); self.theme_combo.setCurrentIndex(int(dark)); self.theme_combo.blockSignals(False)
+        if save: self.store.set_setting("theme","dark" if dark else "light")
+        for player in self.players:
+            player.setStyleSheet(style); player.scene.dark=dark
+
+    def save_quality(self,value):
+        self.studio.default_profile=value; self.store.set_setting("quality",value)
+    def save_sound(self,value):
+        self.studio.sound_enabled=value; self.store.set_setting("sound",value)
+    def choose_output(self):
+        if self.studio.state not in ("idle","ready","archived","stopped","complete"):
+            self.notify("Change the output folder after the current recording finishes."); return
+        folder=QFileDialog.getExistingDirectory(self,"Choose output folder",self.studio.output_folder)
+        if folder:
+            self.studio.output_folder=folder; self.store.set_setting("output",folder)
+            self.output_value.setText(folder); self.studio.folder_label.setText("SAVING TO / "+folder)
+
+    def notify(self,text):
+        self.global_status.setText(str(text))
+    def studio_changed(self,state):
+        changed=state!=self.last_state
+        self.last_state=state
+        title=self.studio.scene.title if self.studio.media else "Ready to make a tape"
+        self.global_status.setText(f"{state.upper()}  /  {title}")
+        if self.active_queue:
+            if changed:
+                self.store.update_queue(self.active_queue,status=state,title=title)
+            if state=="idle" and self.studio.last_error:
+                self.queue_terminal="failed"
+            elif state=="stopped":
+                self.queue_terminal="failed" if self.studio.last_error else "cancelled"
+            if changed: self.refresh_queue()
+
+    def save_recording(self,info,cover):
+        try:
+            if self.demo and not info["path"]:
+                info["path"]=str(self.demo_audio())
+            tape=self.store.add_tape(info,cover)
+            self.studio.current_tape_id=tape["id"]
+            self.refresh_catalog()
+        except Exception as exc:
+            self.queue_running=False
+            self.studio.current_tape_id=None
+            self.studio.last_error="Could not save the collection: "+str(exc)
+            QMessageBox.warning(self,"Collection could not be saved",f"The media file remains in the output folder.\n{exc}")
+
+    def archive_recording(self):
+        key=self.studio.current_tape_id
+        if key:
+            self.store.update_tape(key,kept=True)
+            tape=self.store.tape(key)
+            start=self.studio.scene.mapTo(self,QPointF(self.studio.scene.width()*.8,self.studio.scene.height()*.8).toPoint()) if self.stack.currentIndex()==1 else self.global_status.mapTo(self,self.global_status.rect().center())
+            end=self.nav[2].mapTo(self,self.nav[2].rect().center())
+            ArchiveFlight(self,QPointF(start),QPointF(end),tape["title"],self.store.cover(key))
+        if self.active_queue:
+            self.queue_terminal="complete" if key else "failed"
+        self.refresh_catalog()
+
+    @staticmethod
+    def clear_layout(layout):
+        while layout.count():
+            item=layout.takeAt(0)
+            if item.widget(): item.widget().deleteLater()
+
+    def tape_card(self,tape,compact=False):
+        frame=QFrame(); frame.setObjectName("card"); frame.setMinimumWidth(235)
+        layout=QVBoxLayout(frame); layout.setContentsMargins(12,12,12,12)
+        art=TapeArt(tape,self.store.cover(tape["id"])); art.clicked.connect(lambda:self.play_tape(tape["id"]))
+        layout.addWidget(art)
+        layout.addWidget(text_label(tape["title"],"panelTitle",elide=True))
+        layout.addWidget(text_label(tape.get("quality","Local")+"  ·  "+tape.get("duration_text","—"),"hint"))
+        row=QHBoxLayout(); row.addWidget(button("▶ PLAY",lambda:self.play_tape(tape["id"]),"primary"),1)
+        more=button("•••",lambda:self.tape_menu(tape["id"],frame),"secondary"); row.addWidget(more)
+        layout.addLayout(row)
+        return frame
+
+    def refresh_catalog(self,*args):
+        if not hasattr(self,"shelf"): return
+        all_tapes=self.store.tapes()
+        self.catalog_count.setText(f"{len(all_tapes):03} TAPES")
+        self.home_summary.setText(f"RECENT RECORDINGS  /  {len(all_tapes)} in your collection")
+        self.clear_layout(self.shelf); self.clear_layout(self.recent_layout)
+        items=self.store.tapes(self.search.text())
+        self.collection_empty.setVisible(not items)
+        cols=3 if self.width()>=1250 else 2
+        for i,tape in enumerate(items): self.shelf.addWidget(self.tape_card(tape),i//cols,i%cols)
+        for tape in all_tapes[:2]: self.recent_layout.addWidget(self.tape_card(tape,True))
+        if not all_tapes:
+            self.recent_layout.addWidget(text_label("Your first cassette is waiting to be made.","hint"))
+
+    def tape_menu(self,key,widget):
+        menu=QMenu(self)
+        menu.addAction("Open file externally",lambda:self.open_tape(key))
+        menu.addAction("Open containing folder",lambda:self.open_tape(key,folder=True))
+        menu.addAction("Edit name / tape color",lambda:self.edit_tape(key))
+        menu.addAction("Locate moved file…",lambda:self.locate_tape(key))
+        menu.exec(widget.mapToGlobal(widget.rect().bottomRight()))
+
+    def resolve_tape(self,key):
+        tape=self.store.tape(key)
+        if tape and Path(tape["path"]).is_file(): return tape
+        self.notify("File is missing or moved. Use ••• → Locate moved file.")
+        return None
+    def play_tape(self,key):
+        tape=self.resolve_tape(key)
+        if not tape: return
+        player=PlayerDialog(tape,self.store.cover(key),self.dark,self)
+        player.setStyleSheet(stylesheet(self.dark)); self.players.append(player)
+        player.finished.connect(lambda result:self.players.remove(player) if player in self.players else None)
+        player.show(); player.toggle()
+    def open_path(self,path):
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))): self.notify("Could not open: "+str(path))
+    def open_tape(self,key,folder=False):
+        tape=self.resolve_tape(key)
+        if tape: self.open_path(Path(tape["path"]).parent if folder else tape["path"])
+    def locate_tape(self,key):
+        path,_=QFileDialog.getOpenFileName(self,"Locate the media file")
+        if path: self.store.update_tape(key,path=path); self.refresh_catalog()
+
+    def edit_tape(self,key):
+        tape=self.store.tape(key)
+        dialog=QDialog(self); dialog.setWindowTitle("Edit tape label"); dialog.setMinimumWidth(410)
+        form=QFormLayout(dialog); name=QLineEdit(tape["title"]); colors=QComboBox(); colors.addItems(COLORS)
+        colors.setCurrentText(next((k for k,v in COLORS.items() if v==tape.get("color")),"Forest"))
+        form.addRow("Tape name",name); form.addRow("Shell color",colors)
+        buttons=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
+        if dialog.exec()==QDialog.Accepted and name.text().strip():
+            self.store.update_tape(key,title=name.text().strip(),color=COLORS[colors.currentText()]); self.refresh_catalog()
+
+    def import_files(self):
+        paths,_=QFileDialog.getOpenFileNames(self,"Import existing recordings",self.studio.output_folder,"Media (*.mp4 *.mkv *.webm *.mp3 *.wav *.m4a *.flac *.ogg);;All files (*)")
+        for path in paths:
+            self.store.add_tape(dict(title=Path(path).stem,creator="Local file",platform="Local",duration_text="—",quality=Path(path).suffix[1:].upper(),path=path,url="",color=list(COLORS.values())[len(self.store.tapes())%len(COLORS)],kept=True))
+        self.refresh_catalog()
+
+    def add_queue(self):
+        urls=[line.strip() for line in self.queue_input.toPlainText().splitlines() if line.strip()]
+        try: valid=bool(urls) and all(urlsplit(u).scheme in ("http","https") and urlsplit(u).netloc for u in urls)
+        except ValueError: valid=False
+        if not valid:
+            self.notify("Paste complete http:// or https:// links, one per line."); return
+        self.store.add_queue(list(dict.fromkeys(urls)),self.queue_profile.currentText())
+        self.queue_input.clear(); self.refresh_queue(); self.notify(f"Added {len(set(urls))} tapes to the queue.")
+
+    def start_queue(self):
+        if not self.active_queue and self.studio.state not in ("idle","archived","stopped"):
+            self.notify("Finish or reset the current Studio tape before starting the queue."); return
+        self.queue_running=True; self.refresh_queue()
+    def pause_queue(self):
+        self.queue_running=False; self.refresh_queue(); self.notify("Queue paused. The current tape will finish and be kept.")
+    def cancel_queue_item(self,key):
+        if key==self.active_queue:
+            if self.studio.state in ("analyzing","ready"):
+                self.queue_terminal="cancelled"; self.notify("Cancelling this item when analysis returns.")
+            elif self.studio.state in ("ejecting","complete","archiving","archived"):
+                self.notify("This recording has finished and is being saved.")
+            else: self.studio.stop_download()
+        else: self.store.update_queue(key,status="cancelled")
+        self.refresh_queue()
+    def retry_queue_item(self,key):
+        self.store.update_queue(key,status="pending",error=""); self.refresh_queue()
+
+    def refresh_queue(self):
+        if not hasattr(self,"queue_table"): return
+        items=self.store.queue(); self.queue_table.setRowCount(len(items))
+        self.queue_art.set_items(items)
+        for row,item in enumerate(items):
+            for col,text in enumerate((item.get("title",item["url"]),item["profile"],item["status"].upper())):
+                cell=QTableWidgetItem(text); cell.setToolTip(item.get("error") or item["url"]); self.queue_table.setItem(row,col,cell)
+            key=item["id"]
+            if item["status"] in ("failed","cancelled"):
+                action=button("RETRY",lambda checked=False,k=key:self.retry_queue_item(k),"quiet")
+            elif item["status"]=="complete": action=text_label("✓ KEPT","hint")
+            else: action=button("CANCEL",lambda checked=False,k=key:self.cancel_queue_item(k),"quiet")
+            self.queue_table.setCellWidget(row,3,action); self.queue_table.setRowHeight(row,51)
+        pending=sum(x["status"]=="pending" for x in items)
+        self.nav[3].setText(f"≡   Queue  {pending}")
+        self.queue_summary.setText(f"{'RUNNING' if self.queue_running else 'PAUSED'}  /  {pending} waiting  /  one recording at a time")
+
+    def queue_tick(self):
+        s=self.studio
+        self.global_progress.setText(s.percent_label.text() if s.state in ("recording","processing","stopping") else "")
+        if self.active_queue:
+            if self.queue_terminal and not s.info_job and not s.download_job and s.state in ("idle","archived","stopped","ready"):
+                self.store.update_queue(self.active_queue,status=self.queue_terminal,error=s.last_error)
+                self.active_queue=None; self.queue_terminal=None; s.automatic=False
+                s.default_profile=self.store.setting("quality","MP4 Best")
+                if s.state in ("archived","stopped","ready"): s.new_tape()
+                self.refresh_queue(); return
+            if self.queue_terminal=="cancelled": return
+            if s.state=="ready" and not s.info_job:
+                s.insert_tape()
+            elif s.state=="complete" and not s.download_job:
+                s.keep_tape()
+            return
+        if not self.queue_running or s.info_job or s.download_job: return
+        if s.state not in ("idle","archived","stopped"): return
+        pending=next((x for x in self.store.queue() if x["status"]=="pending"),None)
+        if not pending:
+            self.queue_running=False; self.refresh_queue(); return
+        if s.state!="idle": s.new_tape()
+        self.active_queue=pending["id"]; self.queue_terminal=None
+        s.automatic=True; s.last_error=""; s.default_profile=pending["profile"]
+        s.url_input.setText(pending["url"]); s.analyze()
+
+    def demo_audio(self):
+        path=self.store.directory/"demo-tone.wav"
+        if not path.exists():
+            import struct
+            with wave.open(str(path),"wb") as f:
+                f.setnchannels(1); f.setsampwidth(2); f.setframerate(22050)
+                f.writeframes(b"".join(struct.pack("<h",int(1800*math.sin(i*2*math.pi*220/22050))) for i in range(22050*3)))
+        return path
+
+    def seed_demo(self):
+        if self.store.tapes(): return
+        path=str(self.demo_audio())
+        for i,title in enumerate(("Night drive / city lights","Sunday, on repeat","Little things worth keeping")):
+            cover=QPixmap(480,270); p=QPainter(cover); p.setRenderHint(QPainter.Antialiasing)
+            g=QLinearGradient(0,0,480,270)
+            g.setColorAt(0,QColor(("#183b57","#6a8071","#be785f")[i])); g.setColorAt(1,QColor(("#815670","#d9bc87","#dbc791")[i]))
+            p.fillRect(cover.rect(),g); p.setPen(Qt.NoPen); p.setBrush(QColor("#ebc57f")); p.drawEllipse(QRectF(305,38,92,92))
+            p.setBrush(QColor(("#102a43","#344e4b","#775c55")[i]))
+            for j in range(12): p.drawRoundedRect(QRectF(j*44-10,160+(j%3)*14,35,120),4,4)
+            p.end(); data=QByteArray(); buffer=QBuffer(data); buffer.open(QIODevice.WriteOnly); cover.save(buffer,"PNG")
+            self.store.add_tape(dict(title=title,creator="RetroRip Demo",platform="Demo",duration_text="00:03",duration=3,quality="WAV Demo",path=path,color=list(COLORS.values())[i],kept=True,demo=True),bytes(data))
+        self.refresh_catalog()
 
     def closeEvent(self,event):
-        if self.info_job or self.download_job:
-            event.ignore()
-            self.show_error("A job is still running", "Wait for analysis to finish, or use STOP to cancel the recording before closing.")
-            return
-        self.demo_timer.stop()
-        self.scene.timer.stop()
-        event.accept()
-
-    def load_demo_media(self):
-        if self.state != "analyzing":
-            return
-        info = MediaInfo("Night drive / city lights", "RetroRip Studio", "Demo", 223,
-                         "https://example.invalid/demo", [1080,720,480])
-        self.media_ready(info,b"")
-
-    def demo_tick(self):
-        if self.state not in ("recording","processing"):
-            self.demo_timer.stop()
-            return
-        self.demo_progress += 2
-        if self.demo_progress <= 100:
-            self.on_progress({"status":"downloading", "percent":self.demo_progress,
-                              "filename":"demo.mp4", "downloaded_bytes":int(self.demo_progress*850000),
-                              "speed":8_500_000, "eta":(100-self.demo_progress)/20})
-        elif self.demo_progress <= 120:
-            self.on_status("Processing media with FFmpeg...")
-        else:
-            self.demo_timer.stop()
-            self.on_success()
-
-
-STYLE = """
-QMainWindow { background: #f3f0e7; }
-QWidget { color: #273f48; font-family: 'Segoe UI'; font-size: 13px; }
-QLabel#brand { font-size: 19px; font-weight: 800; letter-spacing: 2px; color: #1a3742; }
-QLabel#navSmall { font-family: 'Consolas'; font-size: 10px; color: #8c9186; padding-left: 13px; }
-QFrame#rule { background: #dadbd0; border: none; }
-QLabel#headline { font-size: 35px; font-weight: 800; color: #263f49; letter-spacing: -1px; }
-QLabel#subheading { color: #888d81; font-size: 13px; padding-top: 4px; }
-QLabel#steps { font-family: 'Consolas'; font-size: 10px; color: #8e9285; padding-bottom: 6px; }
-QFrame#panel { background: #fffcf5; border: 1px solid #dfdfd3; border-radius: 16px; }
-QLabel#eyebrow { font-family: 'Consolas'; font-size: 10px; font-weight: bold; color: #a96646; letter-spacing: 2px; }
-QLabel#hint { font-size: 12px; color: #899083; }
-QLabel#panelTitle { font-size: 19px; font-weight: 650; color: #2b4349; }
-QLabel#readout { font-family: 'Consolas'; font-size: 13px; font-weight: bold; color: #ac6441; }
-QLabel#footer { color: #8e9185; font-family: 'Consolas'; font-size: 10px; }
-QLabel#footerTiny { color: #9c9f92; font-family: 'Consolas'; font-size: 9px; }
-QLineEdit, QComboBox { background: #f4f2e9; border: 1px solid #d8dbce; border-radius: 9px;
-                       padding: 11px 14px; color: #314a50; font-size: 14px; min-height: 21px; }
-QLineEdit:focus, QComboBox:focus { border-color: #bd7754; background: #fffdf7; }
-QComboBox::drop-down { border: none; width: 24px; }
-QComboBox QAbstractItemView { background: #fffcf5; color: #29444b; selection-background-color: #e5d1b6; }
-QPushButton { padding: 11px 20px; border-radius: 9px; font-size: 12px; font-weight: 700; min-height: 23px; }
-QPushButton#primary { background: #c96d45; color: #fff8e9; border: 1px solid #b8633e; border-bottom: 3px solid #9e5130; }
-QPushButton#primary:hover { background: #d87c50; border-color: #bd643e; }
-QPushButton#primary:pressed { background: #b95b39; border-bottom-width: 1px; padding-top: 13px; }
-QPushButton#secondary { background: #eaece2; color: #46605f; border: 1px solid #d4d9cc; }
-QPushButton#secondary:hover { background: #dce3d5; }
-QPushButton#quiet { background: transparent; color: #7b8679; border: none; font-size: 10px; padding: 3px 8px; min-height: 15px; }
-QPushButton#quiet:hover { color: #ae6644; background: #e9e8dc; }
-QPushButton:disabled { background: #deded1; color: #a2a495; border-color: #d3d6c9; }
-QPushButton#primary:disabled { background: #d9ba9d; border-color: #d5b79d; color: #faf3e8; }
-QProgressBar { background: #e6e7da; border: none; border-radius: 5px; min-height: 10px; max-height: 10px; }
-QProgressBar::chunk { background: #c9764e; border-radius: 5px; }
-QToolTip { background: #263f46; color: #fff4df; border: none; padding: 6px; }
-"""
+        if self.studio.info_job or self.studio.download_job:
+            self.notify("Use STOP and wait for the active job before closing."); event.ignore(); return
+        self.pump.stop(); self.studio.demo_timer.stop(); self.studio.scene.timer.stop(); self.home_scene.timer.stop()
+        for player in list(self.players): player.close()
+        self.store.close(); event.accept()
 
 
 def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("RetroRip")
-    app.setStyle("Fusion")
-    app.setFont(QFont("Segoe UI",10))
-    window = RetroRipWindow(demo="--demo" in sys.argv)
-    window.show()
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--demo",action="store_true")
+    parser.add_argument("--data-dir",help="Optional custom catalog directory")
+    args=parser.parse_args()
+    app=QApplication([]); app.setApplicationName("RetroRip"); app.setOrganizationName("RetroRip")
+    app.setWindowIcon(QIcon(str(Path(__file__).resolve().parent/"assets"/"retrorip.svg")))
+    app.setStyle("Fusion"); app.setFont(QFont("Segoe UI",10))
+    window=AppWindow(args.data_dir,args.demo); window.show()
     return app.exec()
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__=="__main__":
+    raise SystemExit(main())
